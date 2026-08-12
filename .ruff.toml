@@ -1,0 +1,12 @@
+# PEP 8 conformance (Python's equivalent of PSR-12).
+# Run: python3 -m ruff check src tests
+line-length = 100
+target-version = "py311"
+
+[lint]
+# E/W = pycodestyle (PEP 8), F = pyflakes, I = isort (import order), B = bugbear
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = [
+    # E501 handled by ruff formatter / kept for long URLs in config
+    "E501",
+]

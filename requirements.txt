@@ -1,0 +1,9 @@
+pymysql>=1.1
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+html5lib>=1.1
+schedule>=1.2
+
+# CloakBrowser stealth Chromium (installed separately in .cloak-venv)
+# cloakbrowser==0.4.0

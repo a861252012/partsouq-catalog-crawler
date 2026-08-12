@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.partsouq.crawler.watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+        <string>/Users/a861252012/Desktop/folder/code/partsouq-crawler/scripts/watchdog.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/a861252012/Desktop/folder/code/partsouq-crawler</string>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/a861252012/Desktop/folder/code/partsouq-crawler/logs/watchdog.launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/a861252012/Desktop/folder/code/partsouq-crawler/logs/watchdog.launchd.err.log</string>
+</dict>
+</plist>

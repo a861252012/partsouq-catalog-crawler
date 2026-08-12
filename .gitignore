@@ -1,0 +1,20 @@
+# 敏感資料：cookie（含 cf_clearance / PHPSESSID）絕不可進版控
+data/cookies.json
+data/cloak_profile/
+
+# 日誌（可能含網址、錯誤細節）
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# 環境與本機設定
+.env
+*.local
+
+# 測試/快取
+.ruff_cache/
+.pytest_cache/
