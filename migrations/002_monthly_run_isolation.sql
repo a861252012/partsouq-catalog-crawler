@@ -14,6 +14,9 @@
 --       mysql ... partsouq_crawler_test < migrations/002_monthly_run_isolation.sql
 -- 注意：不內含 USE 陳述；DB 由命令列指定，資訊架構檢查用 DATABASE() 對齊。
 
+SET SESSION lock_wait_timeout = 30;
+SET SESSION innodb_lock_wait_timeout = 30;
+
 -- crawl_runs.run_key
 SET @col := (SELECT COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='crawl_runs'

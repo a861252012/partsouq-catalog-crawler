@@ -16,6 +16,8 @@
 # `{}`（dict literal），改用 .format()/f-string 會與腳本內容衝突。
 import json
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -31,6 +33,14 @@ HTTP_GET = "http://{host}/json/new?{url}"
 # 驗證頁檢查間隔與逾時
 TURNSTILE_CHECK_INTERVAL = 3.0
 CHALLENGE_TIMEOUT = 90.0
+CDP_START_TIMEOUT = 60.0
+COOKIE_EXPORT_TIMEOUT = 180.0
+
+# 只管理本程序親自啟動的 CloakBrowser process group。不得用 pkill 掃描
+# 共用機器上的命令列，否則會誤殺其他專案的 CloakBrowser。
+_BROWSER_LOCK = threading.Lock()
+_browser_proc = None
+_browser_err_log = None
 
 # ---------------------------------------------------------------------------
 # 全域 single-flight 的 session 狀態
@@ -65,43 +75,50 @@ def _cf_value(cookies) -> str:
     return ""
 
 
-def _kill_browsers():
-    """清除任何殘留的 CloakBrowser/Chromium 程序（最多嘗試 3 輪）。"""
-    for _ in range(3):
-        for pat in ("remote-debugging-port=9242", "cloakbrowser.launch_async"):
-            # 診斷探針：pkill 前記錄它會匹配到哪些 pid（過去發生過
-            # crawler 在 refresh deadline 被 SIGKILL 的謎團，需要確認
-            # pkill 是否誤匹配到 crawler 本身）。
-            try:
-                probe = subprocess.run(
-                    ["pgrep", "-fl", pat], capture_output=True, text=True, timeout=5
-                )
-                log.info(
-                    "kill_browsers probe %r matched: %s",
-                    pat,
-                    probe.stdout.strip()[:400] or "(none)",
-                )
-            except Exception as e:
-                log.warning("kill_browsers probe failed: %s", e)
-            subprocess.run(["pkill", "-f", pat], capture_output=True)
-        time.sleep(1)
-        if not _cdp_alive() and not _any_browser_process():
-            return
-    log.warning("browser processes did not die after 3 kill rounds")
+def _stop_owned_browser():
+    """冪等停止本程序啟動的 CloakBrowser process group。"""
+    global _browser_err_log, _browser_proc
 
+    with _BROWSER_LOCK:
+        proc = _browser_proc
+        err_log = _browser_err_log
+        _browser_proc = None
+        _browser_err_log = None
 
-def _any_browser_process() -> bool:
-    """檢查是否有 CloakBrowser 程序還活著（用調試埠特徵搜尋）。"""
     try:
-        out = subprocess.run(
-            ["pgrep", "-f", "remote-debugging-port=9242"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return bool(out.stdout.strip())
-    except Exception:
-        return False
+        if proc is None:
+            return
+        running = proc.poll() is None
+        if running:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                running = False
+            except PermissionError:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    running = False
+        if running:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log.error("owned CloakBrowser process group did not exit after SIGKILL")
+    finally:
+        if err_log is not None:
+            err_log.close()
 
 
 def _cdp_alive() -> bool:
@@ -245,15 +262,18 @@ def _wait_challenge_resolved() -> bool:
 
 
 def _launch_cloak() -> bool:
-    """啟動 CloakBrowser 並開啟 CDP 調試埠（冪等：已就緒就直接沿用）。
+    """啟動本程序擁有的 CloakBrowser process group 並等待 CDP。
 
     子程序腳本負責：驅動 CloakBrowser 前往目標頁面、等待 Turnstile
     驗證自動通過、最後把 session cookie 匯出成 JSON 檔案。
     不再仰賴 agent-browser 的常駐 daemon（其長時間運行曾造成
     cookie 匯出不穩定的問題）。
     """
+    global _browser_err_log, _browser_proc
+
     if _cdp_alive():
-        return True
+        log.error("CDP port %s is occupied by an unowned browser", CLOAK["cdp_port"])
+        return False
     script = (
         "import asyncio, json, time, cloakbrowser\n"
         "OUT = %r\n"
@@ -275,17 +295,18 @@ def _launch_cloak() -> bool:
         "        except Exception:\n"
         "            pass\n"
         "        await asyncio.sleep(3)\n"
-        "    time.sleep(2)\n"
+        "    await asyncio.sleep(2)\n"
         "    cookies = await ctx.cookies()\n"
         "    data = [{'name': c['name'], 'value': c['value'],\n"
         "             'domain': c.get('domain', ''), 'path': c.get('path', '/')}\n"
         "            for c in cookies]\n"
-        "    json.dump(data, open(OUT, 'w'))\n"
+        "    with open(OUT, 'w') as f:\n"
+        "        json.dump(data, f)\n"
         "    print('COOKIES_EXPORTED', len(data), flush=True)\n"
-        "    while True:\n"
-        "        await asyncio.sleep(3600)\n"
+        "    await b.close()\n"
         "asyncio.run(main())\n"
     ) % (str(CLOAK["cookie_export_file"]), SITE["genuine"], CLOAK["cdp_port"])  # noqa: UP031
+    err_log = None
     try:
         # 只保留最後一次的 stderr（"w"），避免無上限增長
         err_log = open("/tmp/cloak_launch_err.log", "w")
@@ -293,18 +314,29 @@ def _launch_cloak() -> bool:
             [CLOAK["venv_python"], "-u", "-c", script],
             stdout=subprocess.DEVNULL,
             stderr=err_log,
+            start_new_session=True,
         )
-    except FileNotFoundError:
-        log.error("CloakBrowser venv python not found: %s", CLOAK["venv_python"])
+    except OSError as e:
+        if err_log is not None:
+            err_log.close()
+        log.error("failed to start CloakBrowser via %s: %s", CLOAK["venv_python"], e)
         return False
+    with _BROWSER_LOCK:
+        _browser_proc = proc
+        _browser_err_log = err_log
     log.info("CloakBrowser launching (pid=%s), waiting for CDP...", proc.pid)
-    deadline = time.time() + 60
+    deadline = time.time() + CDP_START_TIMEOUT
     while time.time() < deadline:
+        if proc.poll() is not None:
+            log.error("CloakBrowser exited before CDP became ready (rc=%s)", proc.returncode)
+            _stop_owned_browser()
+            return False
         if _cdp_alive():
             log.info("CloakBrowser CDP ready on :%s", CLOAK["cdp_port"])
             return True
         time.sleep(2)
     log.error("CloakBrowser CDP never became ready")
+    _stop_owned_browser()
     return False
 
 
@@ -394,64 +426,53 @@ def force_refresh_session(rejected_version: str | None = None) -> list | None:
 
 
 def _refresh_impl() -> list | None:
-    """實際的瀏覽器刷新：清掉殘留瀏覽器 → 重新啟動 → 匯出 cookie。"""
+    """實際刷新；離開時一律回收本次擁有的 browser process group。"""
     export_file = CLOAK["cookie_export_file"]
     try:
         export_file.unlink(missing_ok=True)
     except OSError:
         pass
 
-    # 殘留的 CloakBrowser 實例（例如上一場刷新崩潰留下的）會佔住
-    # 調試埠卻永遠不匯出新 cookie：先清掉再刷新。
-    if _cdp_alive() or _any_browser_process():
-        log.info("stale browser detected, killing before refresh")
-        _kill_browsers()
-        time.sleep(2)
+    _stop_owned_browser()
+    try:
+        if not _launch_cloak():
+            _mark_refresh_failed()
+            return None
 
-    if not _launch_cloak():
+        # 等待瀏覽器內部的腳本匯出 cookie（它會自動解決 Turnstile 驗證）
+        deadline = time.time() + COOKIE_EXPORT_TIMEOUT
+        last_progress_log = 0.0
+        while time.time() < deadline:
+            if time.time() - last_progress_log >= 30:
+                last_progress_log = time.time()
+                log.info("waiting for cookie export... %ds elapsed", int(deadline - time.time()))
+            if export_file.exists():
+                try:
+                    cookies = json.loads(export_file.read_text())
+                    if cookies:
+                        names = {c["name"] for c in cookies}
+                        if "cf_clearance" not in names:
+                            log.error(
+                                "exported cookies missing cf_clearance (%s); refresh failed",
+                                sorted(names),
+                            )
+                            _mark_refresh_failed()
+                            return None
+                        save_cookies(cookies)
+                        log.info(
+                            "session cookies exported: %s (has cf_clearance=%s)",
+                            sorted(names),
+                            "cf_clearance" in names,
+                        )
+                        return cookies
+                except (json.JSONDecodeError, OSError) as e:
+                    log.warning("cookie export not ready yet: %s", e)
+            time.sleep(3)
+        log.error("no cookies exported within %ss", COOKIE_EXPORT_TIMEOUT)
         _mark_refresh_failed()
         return None
-
-    # 等待瀏覽器內部的腳本匯出 cookie（它會自動解決 Turnstile 驗證）
-    deadline = time.time() + 180
-    last_progress_log = 0.0
-    while time.time() < deadline:
-        # 每 30 秒記錄一次等待狀態：過去 crawler 曾在此迴圈被 SIGKILL，
-        # 需要知道卡在哪個階段（診斷用）。
-        if time.time() - last_progress_log >= 30:
-            last_progress_log = time.time()
-            log.info("waiting for cookie export... %ds elapsed", int(deadline - time.time()))
-        if export_file.exists():
-            try:
-                cookies = json.loads(export_file.read_text())
-                if cookies:
-                    names = {c["name"] for c in cookies}
-                    # 必要證據：cf_clearance = 瀏覽器真正通過 Cloudflare
-                    # 驗證的證明。缺少它就代表 Turnstile 尚未解完，
-                    # 這批 cookie 馬上會被 challenge —— fail closed，
-                    # 不該當成「刷新成功」存檔。
-                    if "cf_clearance" not in names:
-                        log.error(
-                            "exported cookies missing cf_clearance (%s); refresh failed",
-                            sorted(names),
-                        )
-                        _kill_browsers()
-                        _mark_refresh_failed()
-                        return None
-                    save_cookies(cookies)
-                    log.info(
-                        "session cookies exported: %s (has cf_clearance=%s)",
-                        sorted(names),
-                        "cf_clearance" in names,
-                    )
-                    return cookies
-            except (json.JSONDecodeError, OSError) as e:
-                log.warning("cookie export not ready yet: %s", e)
-        time.sleep(3)
-    log.error("no cookies exported within %ss", 180)
-    _kill_browsers()
-    _mark_refresh_failed()
-    return None
+    finally:
+        _stop_owned_browser()
 
 
 def _mark_refresh_failed():

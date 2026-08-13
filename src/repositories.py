@@ -171,6 +171,19 @@ class VehicleRepository:
     def upsert_category(self, vehicle_id: int, name: str, cid: str | None) -> int:
         """新增或更新分類。cid 存在時以 vehicle_id + cid 為穩定身分。"""
         cid = cid or None
+        if cid:
+            # 正式爬取的 category 一定有 cid，可直接利用 uq_cat_cid，
+            # 省掉每個 group 都先 SELECT、再 UPDATE 的兩次往返。
+            cur = self.db._execute(
+                "INSERT INTO categories (vehicle_id, name, cid) VALUES (%s, %s, %s) AS new "
+                "ON DUPLICATE KEY UPDATE name = new.name, fetched_at = NOW(), "
+                "id = LAST_INSERT_ID(id)",
+                (vehicle_id, name, cid),
+            )
+            return cur.lastrowid
+
+        # cid 為 NULL 時 uq_cat_cid 不會判定重複，只能維持以名稱查找的
+        # 相容路徑；不能假裝成安全的單句 upsert。
         identity_sql = "cid = %s" if cid else "name = %s"
         identity_value = cid if cid else name
         cur = self.db._execute(
@@ -245,9 +258,9 @@ class PartRepository:
         (group_id, part_number, range_str)，同料號不同 range 會真的
         插入兩列，統計必須與唯一鍵一致才不會低估。
         """
-        if run_id is not None:
-            self.clear_group_membership(group_id)
         if not parts:
+            if run_id is not None:
+                self.clear_group_membership(group_id)
             return 0
         # 先查出該零件組既有的料號+範圍 → 用來判斷哪些是新插入
         cur = self.db._execute(
@@ -278,6 +291,10 @@ class PartRepository:
             "updated_at = CURRENT_TIMESTAMP",
             rows,
         )
+        if run_id is not None:
+            # 先將本次仍存在的列標記為 current，再只清掉未出現在本次
+            # payload 的舊列，避免所有現存列每次都先寫 NULL 再寫 run_id。
+            self._clear_stale_group_membership(group_id, run_id)
         seen = set()
         new_count = 0
         for p in parts:
@@ -290,6 +307,13 @@ class PartRepository:
     def clear_group_membership(self, group_id: int):
         """清除單一 group 的舊 run membership；與後續 upsert 同交易。"""
         self.db._execute("UPDATE parts SET seen_run_id = NULL WHERE group_id = %s", (group_id,))
+
+    def _clear_stale_group_membership(self, group_id: int, run_id: int):
+        """只清除本次 payload 已不存在的 membership。"""
+        self.db._execute(
+            "UPDATE parts SET seen_run_id = NULL WHERE group_id = %s AND seen_run_id <> %s",
+            (group_id, run_id),
+        )
 
     def count_parts_in_group(self, group_id: int) -> int:
         """統計某零件組下的零件數量（供驗證與監督使用）。"""
@@ -308,6 +332,20 @@ class CrawlRepository:
         # 用空字串而非 None：MySQL 唯一鍵對 NULL 不視為相同，會破壞
         # ON DUPLICATE 的覆寫語意。
         self.run_key = run_key or ""
+
+    def remaining_group_count(self, run_key: str = "") -> int:
+        """回傳指定 run 尚未取得 terminal receipt 的 group 數量。"""
+        if run_key:
+            cur = self.db._execute(
+                "SELECT COUNT(*) AS n FROM groups_t "
+                "WHERE fetched_run_key IS NULL OR fetched_run_key <> %s "
+                "OR fetched_status IS NULL "
+                "OR fetched_status NOT IN ('done', 'not_found')",
+                (run_key,),
+            )
+        else:
+            cur = self.db._execute("SELECT COUNT(*) AS n FROM groups_t")
+        return cur.fetchone()["n"]
 
     def mark_done(self, scope: str, key: str):
         """把某範圍的某個鍵標記為「完成」。
@@ -407,35 +445,32 @@ class CrawlRepository:
         }
 
     def previous_row_count_map(self, vehicle_id: int, run_key: str = "") -> dict:
-        """一次載入某車「上一 run 之前」每個組的歷史 row_count（SOL review P1）。
+        """一次載入某車每個組已驗證的歷史最高 row_count。
 
-        回傳 {(cid, code): 該組歷史上最大的 fetched_row_count}。
+        回傳 {(cid, code): verified_row_count}。
         縮水偵測的參考點：crawl_group 解析出「格式完整但數量遠少於
-        前次」的零件時，據此拒絕寫 terminal receipt。排除本 run 的
-        receipt —— 本 run 已抓過的組會走 skip，不會來到縮水檢查，
-        但保險起見仍不把它當參考點。
+        歷史最高成功值」的零件時，據此拒絕寫 terminal receipt。
+        high-water 只升不降，因此逐月小幅縮水也無法改寫基準。
         """
         if not run_key:
             return {}
         cur = self.db._execute(
-            "SELECT c.cid, g.code, MAX(g.fetched_row_count) AS row_count "
+            "SELECT c.cid, g.code, g.verified_row_count AS row_count "
             "FROM groups_t g "
             "JOIN categories c ON c.id = g.category_id "
-            "WHERE c.vehicle_id = %s AND g.fetched_row_count > 0 "
-            "AND (g.fetched_run_key IS NULL OR g.fetched_run_key <> %s) "
-            "GROUP BY g.id",
-            (vehicle_id, run_key),
+            "WHERE c.vehicle_id = %s AND g.verified_row_count > 0",
+            (vehicle_id,),
         )
         return {(str(r["cid"] or ""), r["code"]): r["row_count"] or 0 for r in cur.fetchall()}
 
     def previous_row_count(self, group_id: int) -> int:
-        """回傳某零件組歷史上最大的 fetched_row_count（無則 0）。
+        """回傳某零件組歷史上已驗證的最高 row_count（無則 0）。
 
         縮水偵測的後備路徑（未提供 prev_rows map 時逐組查詢，僅測試/
         相容使用；正式爬取一律用 previous_row_count_map 一次載入）。
         """
         cur = self.db._execute(
-            "SELECT MAX(fetched_row_count) AS n FROM groups_t WHERE id = %s", (group_id,)
+            "SELECT verified_row_count AS n FROM groups_t WHERE id = %s", (group_id,)
         )
         return cur.fetchone()["n"] or 0
 
@@ -455,11 +490,19 @@ class CrawlRepository:
         與零件的 upsert 同一交易提交（見 crawl_group）：避免「零件寫了
         但狀態沒寫」的靜默缺漏。
         """
-        self.db._execute(
-            "UPDATE groups_t SET fetched_run_key = %s, fetched_status = %s, "
-            "fetched_row_count = %s WHERE id = %s",
-            (run_key, status, row_count, group_id),
-        )
+        if status == "done":
+            self.db._execute(
+                "UPDATE groups_t SET fetched_run_key = %s, fetched_status = %s, "
+                "fetched_row_count = %s, "
+                "verified_row_count = GREATEST(verified_row_count, %s) WHERE id = %s",
+                (run_key, status, row_count, row_count, group_id),
+            )
+        else:
+            self.db._execute(
+                "UPDATE groups_t SET fetched_run_key = %s, fetched_status = %s, "
+                "fetched_row_count = %s WHERE id = %s",
+                (run_key, status, row_count, group_id),
+            )
 
     def seen(self, scope: str, key: str):
         """記錄「本 run 遇見」某項目（不改變既有狀態）。
@@ -482,10 +525,12 @@ class CrawlRepository:
         prefix 為 None 時回傳全部 scope_key（vehicle scope 因 hash key
         格式不再使用 prefix match）。"""
         if prefix is not None:
+            escaped_prefix = prefix.replace("!", "!!").replace("%", "!%").replace("_", "!_")
             cur = self.db._execute(
                 "SELECT scope_key FROM crawl_state "
-                "WHERE run_key = %s AND scope = %s AND LOCATE(%s, scope_key) = 1",
-                (run_key, scope, prefix),
+                "WHERE run_key = %s AND scope = %s "
+                "AND scope_key LIKE CONCAT(%s, '%%') ESCAPE '!'",
+                (run_key, scope, escaped_prefix),
             )
         else:
             cur = self.db._execute(
@@ -625,31 +670,69 @@ class CrawlRepository:
         )
 
     def publish_success_parts(self, run_id: int):
-        """在同一交易內重建不可變的 current snapshot。
+        """在同一交易內更新不可變的 current snapshot。
 
         normalized tables 可被後續 failed/partial attempt 原地 upsert；因此
-        current view 不直接 join 它們。先清空再依本次 logical run 明確
-        標記的資料重建 ``published_parts``。與 finish_run(success) 同次 commit；
-        任一步失敗 rollback 後，舊 snapshot 仍完整可讀。
+        current view 不直接 join 它們。先 upsert 本次 logical run 明確
+        標記的資料，再刪除不屬於本次 run 的舊列。與 finish_run(success)
+        同次 commit；任一步失敗 rollback 後，舊 snapshot 仍完整可讀。
         """
-        self.db._execute("DELETE FROM published_parts")
-        cur = self.db._execute(
+        source_row = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM parts WHERE seen_run_id = %s",
+            (run_id,),
+        ).fetchone()
+        source_count = int((source_row or {}).get("row_count", 0))
+        if source_count <= 0:
+            raise RuntimeError(f"run {run_id} produced an empty published snapshot")
+
+        self.db._execute(
             "INSERT INTO published_parts ("
             "part_id, brand, model, vehicle_name, vehicle_code, prod_period, "
             "part_name, part_number, category_main, category_group, group_code, "
             "part_range, note, quantity, code, snapshot_at) "
-            "SELECT p.id, b.name, m.name, v.name, v.model_code, v.prod_period, "
-            "p.name, p.part_number, c.name, g.name, g.code, p.range_str, "
-            "p.note, p.quantity, p.code, NOW() "
+            "SELECT source.part_id, source.brand, source.model, source.vehicle_name, "
+            "source.vehicle_code, source.prod_period, source.part_name, "
+            "source.part_number, source.category_main, source.category_group, "
+            "source.group_code, source.part_range, source.note, source.quantity, "
+            "source.code, source.snapshot_at FROM ("
+            "SELECT p.id AS part_id, b.name AS brand, m.name AS model, "
+            "v.name AS vehicle_name, v.model_code AS vehicle_code, "
+            "v.prod_period AS prod_period, p.name AS part_name, "
+            "p.part_number AS part_number, c.name AS category_main, "
+            "g.name AS category_group, g.code AS group_code, "
+            "p.range_str AS part_range, p.note AS note, p.quantity AS quantity, "
+            "p.code AS code, NOW() AS snapshot_at "
             "FROM parts p "
             "JOIN groups_t g ON g.id = p.group_id "
             "JOIN categories c ON c.id = g.category_id "
             "JOIN vehicles v ON v.id = c.vehicle_id "
             "JOIN models m ON m.id = v.model_id "
             "JOIN brands b ON b.id = m.brand_id "
-            "WHERE p.seen_run_id = %s",
+            "WHERE p.seen_run_id = %s) AS source "
+            "ON DUPLICATE KEY UPDATE "
+            "brand = source.brand, model = source.model, "
+            "vehicle_name = source.vehicle_name, vehicle_code = source.vehicle_code, "
+            "prod_period = source.prod_period, part_name = source.part_name, "
+            "part_number = source.part_number, category_main = source.category_main, "
+            "category_group = source.category_group, group_code = source.group_code, "
+            "part_range = source.part_range, note = source.note, "
+            "quantity = source.quantity, code = source.code, "
+            "snapshot_at = source.snapshot_at",
             (run_id,),
         )
-        if isinstance(cur.rowcount, int) and cur.rowcount <= 0:
-            raise RuntimeError(f"run {run_id} produced an empty published snapshot")
-        return cur.rowcount
+        self.db._execute(
+            "DELETE pp FROM published_parts pp "
+            "LEFT JOIN parts p ON p.id = pp.part_id AND p.seen_run_id = %s "
+            "WHERE p.id IS NULL",
+            (run_id,),
+        )
+        published_row = self.db._execute(
+            "SELECT COUNT(*) AS row_count FROM published_parts"
+        ).fetchone()
+        published_count = int((published_row or {}).get("row_count", 0))
+        if published_count != source_count:
+            raise RuntimeError(
+                f"run {run_id} snapshot row count mismatch: "
+                f"source={source_count}, published={published_count}"
+            )
+        return published_count

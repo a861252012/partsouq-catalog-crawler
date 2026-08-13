@@ -20,6 +20,8 @@ launchd 每個月觸發一次本程式。它負責「擁有」爬蟲子程序，
 
 import json
 import logging
+import math
+import os
 import re
 import shutil
 import signal
@@ -48,7 +50,7 @@ COOLDOWN = 30 * 60  # 重啟風暴後的冷卻時間（秒）
 COOKIE_MIN_REMAINING = 5 * 60  # cookie TTL 剩不到 5 分鐘就預先刷新
 MEMORY_LIMIT_MB = 2048  # 爬蟲 RSS 超過此值 => 重啟（疑似記憶體洩漏）
 DISK_MIN_FREE_MB = 5120  # 磁碟剩餘低於此值（MB）=> 記錄並提前退場
-MAX_RUN_SECONDS = 25 * 24 * 3600  # 單趟最長執行時限（25 天）
+MAX_RUN_SECONDS = int(float(CRAWL.get("max_run_days", 25)) * 24 * 3600)  # 單趟最長執行時限
 
 # crawler 入口的命令列特徵：直譯器大小寫不敏感（macOS 的 Python 安裝在
 # /Library/Frameworks/.../MacOS/Python，comm 也可能被截斷）。直譯器 token
@@ -73,6 +75,10 @@ class Supervisor:
         self.crawler_started_at = 0.0
         self.db = None
         self.cooldown_until = 0.0
+        # process 內仍使用 monotonic，避免系統時間校正影響冷卻；磁碟上
+        # 改存 wall-clock epoch，Supervisor 重啟後才能還原剩餘時間。
+        self.restart_state_path = LOG_DIR / "supervisor_state.json"
+        self._restart_state_loaded = False
         self.started_at = time.monotonic()
         # 這趟的統計（結束時寫入 logs/summary.json）
         self.summary = {
@@ -81,6 +87,113 @@ class Supervisor:
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "finished": None,
         }
+
+    # ------------------------------------------------------ restart state
+
+    def _load_restart_state(self):
+        """載入跨程序的重啟窗口與冷卻狀態。
+
+        state file 只存 wall-clock epoch；載入時換回本程序的 monotonic
+        基準。檔案遺失是正常首次啟動，內容損毀則清空後繼續，避免監督
+        程序因一個小型狀態檔永久無法啟動。
+        """
+        self._restart_state_loaded = True
+        self.restarts = []
+        self.cooldown_until = 0.0
+        try:
+            state = json.loads(self.restart_state_path.read_text())
+            if not isinstance(state, dict) or state.get("version") != 1:
+                raise ValueError("unsupported restart state")
+            restart_times = state.get("restart_times", [])
+            if not isinstance(restart_times, list):
+                raise ValueError("restart_times must be a list")
+            cooldown_wall = state.get("cooldown_until", 0)
+            if isinstance(cooldown_wall, bool) or not isinstance(cooldown_wall, (int, float)):
+                raise ValueError("cooldown_until must be a number")
+            cooldown_wall = float(cooldown_wall)
+            if not math.isfinite(cooldown_wall):
+                raise ValueError("cooldown_until must be finite")
+
+            now_wall = time.time()
+            now_mono = time.monotonic()
+            # 一段 cooldown 正常結束後，造成風暴的舊事件也必須一起清掉；
+            # 否則 COOLDOWN(30m) 小於 RESTART_WINDOW(62m)，下一次錯誤會
+            # 立刻再次進入冷卻。
+            cooldown_expired = 0 < cooldown_wall <= now_wall
+            if not cooldown_expired:
+                for value in restart_times:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ValueError("restart timestamp must be a number")
+                    value = float(value)
+                    if not math.isfinite(value):
+                        raise ValueError("restart timestamp must be finite")
+                    age = max(0.0, now_wall - value)
+                    if age < RESTART_WINDOW:
+                        self.restarts.append(now_mono - age)
+
+            if cooldown_wall > now_wall:
+                # 壁鐘若被往回校正，磁碟 deadline 可能異常遙遠；最多只
+                # 恢復一個完整 COOLDOWN，不能把 crawler 永久鎖住。
+                remaining = min(cooldown_wall - now_wall, COOLDOWN)
+                self.cooldown_until = now_mono + remaining
+        except FileNotFoundError:
+            return
+        except (OSError, OverflowError, ValueError, TypeError, json.JSONDecodeError) as e:
+            log.warning("restart state ignored: %s", e)
+            self.restarts = []
+            self.cooldown_until = 0.0
+
+        # 每次載入都原子寫回正規化後的內容，同時移除過期資料或修復
+        # 損毀檔；寫入失敗只降級為本程序內保護，不中止 supervisor。
+        self._persist_restart_state()
+
+    def _persist_restart_state(self):
+        """以原子 replace 保存 restart/cooldown 的 wall-clock 狀態。"""
+        if not self._restart_state_loaded:
+            return
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        restart_times = [
+            now_wall - max(0.0, now_mono - value)
+            for value in self.restarts
+            if isinstance(value, (int, float)) and math.isfinite(value)
+        ]
+        cooldown_wall = (
+            now_wall + max(0.0, self.cooldown_until - now_mono)
+            if self.cooldown_until > now_mono
+            else 0
+        )
+        state = {
+            "version": 1,
+            "restart_times": restart_times,
+            "cooldown_until": cooldown_wall,
+        }
+        tmp_path = self.restart_state_path.with_name(f".{self.restart_state_path.name}.tmp")
+        try:
+            self.restart_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_text(json.dumps(state, separators=(",", ":")) + "\n")
+            os.replace(tmp_path, self.restart_state_path)
+        except OSError as e:
+            log.warning("restart state write failed: %s", e)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _prune_restart_state(self, now: float | None = None):
+        """移除過期窗口；冷卻結束時清空本輪風暴紀錄。"""
+        now = time.monotonic() if now is None else now
+        changed = False
+        if self.cooldown_until and now >= self.cooldown_until:
+            self.cooldown_until = 0.0
+            self.restarts = []
+            changed = True
+        elif not self.cooldown_until:
+            active = [value for value in self.restarts if now - value < RESTART_WINDOW]
+            changed = active != self.restarts
+            self.restarts = active
+        if changed:
+            self._persist_restart_state()
 
     # ------------------------------------------------------------ crawler
 
@@ -226,6 +339,7 @@ class Supervisor:
         設定、從未被讀取，約 15 分鐘窗口過後就會再次重啟）。
         """
         now = time.monotonic()
+        self._prune_restart_state(now)
         if now < self.cooldown_until:
             log.error(
                 "cooldown active (until +%.0fs); not restarting: %s",
@@ -239,7 +353,6 @@ class Supervisor:
             if self.proc is None:
                 self._kill_other_crawlers()
             return
-        self.restarts = [t for t in self.restarts if now - t < RESTART_WINDOW]
         # SOL review P1：先納入本次事件再判斷 —— 舊碼在加入前檢查
         # 門檻，固定週期卡死時第 4 次重啟剛好把窗口邊界上的第 1 次
         # 排除（now - t == W），永遠只有 3 筆、永不進冷卻。
@@ -247,6 +360,7 @@ class Supervisor:
         if len(self.restarts) > RESTART_MAX:
             self.cooldown_until = now + COOLDOWN
             self.summary["cooldowns"] += 1
+            self._persist_restart_state()
             log.error(
                 "restart storm (%d in window): cooldown until +%.0fs", len(self.restarts), COOLDOWN
             )
@@ -255,6 +369,7 @@ class Supervisor:
             # return 讓它繼續存在整段 30 分鐘冷卻期，持續打網站。
             self._kill_current(reason)
             return
+        self._persist_restart_state()
         self.summary["restarts"].append(
             {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -461,6 +576,7 @@ class Supervisor:
 
     def run(self) -> int:
         """監督迴圈主體：連接 DB、啟動爬蟲、每 CHECK_INTERVAL 檢查一次。"""
+        self._load_restart_state()
         self.db = Database().connect()
         try:
             self._cleanup_stale_runs()
@@ -471,7 +587,11 @@ class Supervisor:
                     return 1
                 self._write_summary("already-complete")
                 return 0
-            if not self.start():
+            if time.monotonic() < self.cooldown_until:
+                log.warning("restored restart cooldown; crawler remains stopped")
+                if self._kill_other_crawlers() is not True:
+                    log.error("restored cooldown; stray-crawler cleanup is inconclusive")
+            elif not self.start():
                 return 1
             while True:
                 time.sleep(CHECK_INTERVAL)
@@ -502,6 +622,7 @@ class Supervisor:
 
     def _tick_inner(self):
         """實際的檢查順序（見 _tick 的 docstring）。"""
+        self._prune_restart_state()
         # 1. 程序存活：崩潰的子程序必須被拉回來
         if self.proc is not None:
             rc = self.proc.poll()

@@ -8,6 +8,8 @@
   5. [P1] watchdog spawn 後重新確認 supervisor 存活（spawn 失敗回 1）
   6. [P2] cookie 匯出缺 cf_clearance 時 fail closed
   7. [P2] --no-browser 模式不啟動瀏覽器刷新
+  8. [P1] CloakBrowser 只回收自己擁有的 process group
+  9. [P1] 完成月份不重啟 watchdog、throttle 不累積 burst
 """
 
 import importlib.util
@@ -233,7 +235,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         CRAWL["limit_vehicles"] = 3
         try:
             with (
-                mock.patch("src.crawler.parse_vehicles", return_value=vehicles),
+                mock.patch("src.crawler.parse_vehicles", return_value=(vehicles, 0)),
                 mock.patch.object(c.crawl, "is_done", return_value=False),
                 mock.patch.object(c.crawl, "mark_done") as md,
             ):
@@ -411,7 +413,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         """P0：locate/pick 等非 unit 頁 404 => 視為失敗（不是空資料）。"""
         c = self._crawler()
         c._get = mock.MagicMock(side_effect=NotFoundError("http 404 at /pick"))
-        with mock.patch("src.crawler.parse_vehicles", return_value=[]):
+        with mock.patch("src.crawler.parse_vehicles", return_value=([], 0)):
             with self.assertRaises(NotFoundError):
                 c.crawl_model("TOYOTA", 1, {"name": "COROLLA", "ssd": "s", "url": "u"})
 
@@ -422,7 +424,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         old = CRAWL["block_breather"]
         CRAWL["block_breather"] = 0
         try:
-            with mock.patch("src.crawler.parse_vehicles", return_value=[]):
+            with mock.patch("src.crawler.parse_vehicles", return_value=([], 0)):
                 with self.assertRaises(RuntimeError):
                     c.crawl_model("TOYOTA", 1, {"name": "COROLLA", "ssd": "s", "url": "u"})
         finally:
@@ -1092,7 +1094,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         ]
         c._get = mock.MagicMock(return_value="<html>pick page</html>")
         with (
-            mock.patch("src.crawler.parse_vehicles", return_value=vehicles),
+            mock.patch("src.crawler.parse_vehicles", return_value=(vehicles, 0)),
             mock.patch.object(c.crawl, "is_done", return_value=False),
         ):
             # 所有 submit 回傳「會失敗」的 future（模擬連續失敗）
@@ -1147,7 +1149,7 @@ class TestCrawlRunStatus(unittest.TestCase):
             return f
 
         with (
-            mock.patch("src.crawler.parse_vehicles", return_value=vehicles),
+            mock.patch("src.crawler.parse_vehicles", return_value=(vehicles, 0)),
             mock.patch.object(c.crawl, "is_done", return_value=False),
             mock.patch.object(c._pool, "submit", side_effect=mixed_submit) as submit,
             mock.patch.object(c.crawl, "mark_done") as mark_done,
@@ -1175,7 +1177,8 @@ class TestCrawlRunStatus(unittest.TestCase):
         c._get = mock.MagicMock(return_value="<html>locate</html>")
         with (
             mock.patch(
-                "src.crawler.parse_brand_index", return_value=[{"name": "M1"}, {"name": "M2"}]
+                "src.crawler.parse_brand_index",
+                return_value=([{"name": "M1"}, {"name": "M2"}], 0),
             ),
             mock.patch.object(c.crawl, "is_done", return_value=True),
             mock.patch("src.crawler.time.sleep") as sleep,
@@ -1190,7 +1193,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         c._get = mock.MagicMock(return_value="<html>pick</html>")
         vehicles = [{"name": "V", "model_code": "M", "ssd": "s", "vid": "0"}]
         with (
-            mock.patch("src.crawler.parse_vehicles", return_value=vehicles),
+            mock.patch("src.crawler.parse_vehicles", return_value=(vehicles, 0)),
             mock.patch.object(c.crawl, "is_done", return_value=True),
         ):
             failed, worked = c.crawl_model("TOYOTA", 1, {"name": "COROLLA", "ssd": "s", "url": "u"})
@@ -1204,7 +1207,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         c.crawl_brand = Crawler.crawl_brand.__get__(c)
         c._get = mock.MagicMock(return_value="<html>locate</html>")
         with (
-            mock.patch("src.crawler.parse_brand_index", return_value=[{"name": "M1"}]),
+            mock.patch("src.crawler.parse_brand_index", return_value=([{"name": "M1"}], 0)),
             mock.patch.object(c.crawl, "is_done", return_value=False),
             mock.patch.object(c, "crawl_model", return_value=(0, False)),
             mock.patch("src.crawler.time.sleep") as sleep,
@@ -1219,7 +1222,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         c.crawl_brand = Crawler.crawl_brand.__get__(c)
         c._get = mock.MagicMock(return_value="<html>locate</html>")
         with (
-            mock.patch("src.crawler.parse_brand_index", return_value=[{"name": "M1"}]),
+            mock.patch("src.crawler.parse_brand_index", return_value=([{"name": "M1"}], 0)),
             mock.patch.object(c.crawl, "is_done", return_value=False),
             mock.patch.object(c, "crawl_model", return_value=(0, True)),
             mock.patch("src.crawler.time.sleep") as sleep,
@@ -1297,7 +1300,7 @@ class TestCrawlRunStatus(unittest.TestCase):
         c.crawl_brand = Crawler.crawl_brand.__get__(c)
         c._get = mock.MagicMock(return_value="<html>locate</html>")
         with (
-            mock.patch("src.crawler.parse_brand_index", return_value=[{"name": "M1"}]),
+            mock.patch("src.crawler.parse_brand_index", return_value=([{"name": "M1"}], 0)),
             mock.patch.object(c.crawl, "is_done", return_value=True),
             mock.patch.object(c.crawl, "seen") as seen,
         ):
@@ -1356,13 +1359,15 @@ class TestCrawlRunStatus(unittest.TestCase):
 class TestSnapshotAndDbBoundaries(unittest.TestCase):
     def test_category_cid_rename_updates_existing_row(self):
         db = mock.MagicMock()
-        existing = mock.MagicMock()
-        existing.fetchone.return_value = {"id": 7}
-        db._execute.side_effect = [existing, mock.MagicMock()]
+        db._execute.return_value = mock.MagicMock(lastrowid=7)
         repo = VehicleRepository(db)
         self.assertEqual(repo.upsert_category(3, "NEW NAME", "2"), 7)
-        self.assertIn("WHERE vehicle_id = %s AND cid = %s", db._execute.call_args_list[0].args[0])
-        self.assertIn("UPDATE categories SET name", db._execute.call_args_list[1].args[0])
+        db._execute.assert_called_once()
+        sql, params = db._execute.call_args.args
+        self.assertIn("INSERT INTO categories", sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)
+        self.assertIn("id = LAST_INSERT_ID(id)", sql)
+        self.assertEqual(params, (3, "NEW NAME", "2"))
 
     def test_fresh_run_resets_logical_window(self):
         db = mock.MagicMock()
@@ -1375,15 +1380,56 @@ class TestSnapshotAndDbBoundaries(unittest.TestCase):
         self.assertIn("finished_at = NULL", sql)
         self.assertIn("status = 'running'", sql)
 
-    def test_publish_rebuilds_independent_snapshot_for_run(self):
+    def test_publish_updates_independent_snapshot_for_run(self):
         db = mock.MagicMock()
+        source_count = mock.MagicMock()
+        source_count.fetchone.return_value = {"row_count": 2}
+        upsert = mock.MagicMock()
+        delete_stale = mock.MagicMock()
+        published_count = mock.MagicMock()
+        published_count.fetchone.return_value = {"row_count": 2}
+        db._execute.side_effect = [source_count, upsert, delete_stale, published_count]
         repo = CrawlRepository(db)
-        repo.publish_success_parts(46)
+        self.assertEqual(repo.publish_success_parts(46), 2)
         calls = db._execute.call_args_list
-        self.assertEqual(calls[0].args[0], "DELETE FROM published_parts")
+        self.assertIn("COUNT(*) AS row_count FROM parts", calls[0].args[0])
         self.assertIn("INSERT INTO published_parts", calls[1].args[0])
         self.assertIn("WHERE p.seen_run_id = %s", calls[1].args[0])
+        self.assertIn("ON DUPLICATE KEY UPDATE", calls[1].args[0])
         self.assertEqual(calls[1].args[1], (46,))
+        self.assertIn("DELETE pp FROM published_parts", calls[2].args[0])
+        self.assertIn("p.seen_run_id = %s", calls[2].args[0])
+        self.assertEqual(calls[2].args[1], (46,))
+        self.assertIn("COUNT(*) AS row_count FROM published_parts", calls[3].args[0])
+
+    def test_publish_rejects_empty_source_before_snapshot_writes(self):
+        db = mock.MagicMock()
+        source_count = mock.MagicMock()
+        source_count.fetchone.return_value = {"row_count": 0}
+        db._execute.return_value = source_count
+        repo = CrawlRepository(db)
+
+        with self.assertRaisesRegex(RuntimeError, "empty published snapshot"):
+            repo.publish_success_parts(46)
+
+        db._execute.assert_called_once()
+
+    def test_publish_rejects_snapshot_count_mismatch(self):
+        db = mock.MagicMock()
+        source_count = mock.MagicMock()
+        source_count.fetchone.return_value = {"row_count": 2}
+        published_count = mock.MagicMock()
+        published_count.fetchone.return_value = {"row_count": 1}
+        db._execute.side_effect = [
+            source_count,
+            mock.MagicMock(),
+            mock.MagicMock(),
+            published_count,
+        ]
+        repo = CrawlRepository(db)
+
+        with self.assertRaisesRegex(RuntimeError, "snapshot row count mismatch"):
+            repo.publish_success_parts(46)
 
     def test_group_receipt_reset_preserves_shrink_baseline(self):
         db = mock.MagicMock()
@@ -1408,10 +1454,13 @@ class TestSnapshotAndDbBoundaries(unittest.TestCase):
         db._execute.return_value.fetchall.return_value = []
         repo = PartRepository(db)
         repo.upsert_parts(7, [{"part_number": "P1", "range_str": ""}], run_id=46)
-        self.assertIn("seen_run_id = NULL", db._execute.call_args_list[0].args[0])
         sql, rows = db._executemany.call_args.args
         self.assertIn("seen_run_id", sql)
         self.assertEqual(rows[0][-1], 46)
+        stale_sql = db._execute.call_args_list[-1].args[0]
+        self.assertIn("seen_run_id = NULL", stale_sql)
+        self.assertIn("seen_run_id <> %s", stale_sql)
+        self.assertEqual(db._execute.call_args_list[-1].args[1], (7, 46))
 
     def test_fresh_reset_and_start_share_first_transaction(self):
         c = Crawler(mock.MagicMock(), mock.MagicMock(), workers=1, fresh=True)
@@ -1471,14 +1520,13 @@ class TestSnapshotAndDbBoundaries(unittest.TestCase):
         self.assertIn("uq_cat_cid", v5_sql)
         self.assertIn("DROP INDEX uq_cat", v5_sql)
         self.assertIn("ADD KEY idx_cat_name", v5_sql)
-        self.assertIn("cr.status IS NULL", v5_sql)
         self.assertLess(
             v5_sql.index("UPDATE crawl_runs SET status = ''error''"),
             v5_sql.index("DELETE FROM vehicles"),
             "migration 必須先讓舊 success 失效，再刪 normalized vehicle tree",
         )
         self.assertLess(
-            v5_sql.index("DELETE cs FROM crawl_state"),
+            v5_sql.index("DELETE FROM crawl_state ORDER BY id LIMIT 1000"),
             v5_sql.index("ALTER TABLE vehicles ADD UNIQUE KEY uq_vehicle_identity_v5 ("),
             "v5 completion marker must be created after state invalidation",
         )
@@ -1763,17 +1811,59 @@ class TestWatchdogRecheck(unittest.TestCase):
             rc = watchdog.main()
             self.assertEqual(rc, 1)
 
-    def test_clean_exit_when_month_done_returns_0(self):
-        """supervisor 乾淨退場（rc=0 且當月 run 已 success）=> 健康，回傳 0。"""
+    def test_completed_month_skips_spawn_and_stale_check(self):
+        """當月已完成 => 不 spawn，也不因最後寫入很舊而誤報。"""
+        queries = []
+
+        def fake_mysql(args, db=None):
+            sql = " ".join(args)
+            queries.append(sql)
+            if "SELECT 1 AS x" in sql:
+                return "1"
+            if "SELECT parts_ok" in sql:
+                return "321"
+            self.fail(f"completed month must not query live parts progress: {sql}")
+
         with (
             mock.patch.object(watchdog, "_is_running", return_value=False),
-            mock.patch.object(watchdog, "_mysql", return_value="1"),
+            mock.patch.object(watchdog, "_mysql", side_effect=fake_mysql),
             mock.patch.object(watchdog, "_month_crawl_done", return_value=True),
             mock.patch("subprocess.Popen") as popen,
         ):
-            popen.return_value = mock.MagicMock(pid=123, poll=lambda: 0, returncode=0)
             rc = watchdog.main()
             self.assertEqual(rc, 0)
+            popen.assert_not_called()
+
+        saved = json.loads(watchdog.STATUS_FILE.read_text())
+        self.assertTrue(saved["completed"])
+        self.assertFalse(saved["stalled"])
+        self.assertEqual(saved["parts_count"], "321")
+        self.assertFalse(any("MAX(updated_at)" in sql for sql in queries))
+
+    def test_progress_query_does_not_count_large_parts_table(self):
+        """每小時 heartbeat 不得對 parts 做 exact COUNT(*)。"""
+        queries = []
+
+        def fake_mysql(args, db=None):
+            sql = " ".join(args)
+            queries.append(sql)
+            if "SELECT 1 AS x" in sql:
+                return "1"
+            if "MAX(updated_at)" in sql:
+                return datetime.now().isoformat(sep=" ")
+            return None
+
+        with (
+            mock.patch.object(watchdog, "_is_running", side_effect=[True, True]),
+            mock.patch.object(watchdog, "_mysql", side_effect=fake_mysql),
+            mock.patch.object(watchdog, "_month_crawl_done", return_value=False),
+            mock.patch("subprocess.Popen") as popen,
+        ):
+            self.assertEqual(watchdog.main(), 0)
+            popen.assert_not_called()
+
+        self.assertTrue(any("MAX(updated_at)" in sql for sql in queries))
+        self.assertFalse(any("COUNT(" in sql.upper() for sql in queries))
 
     def test_clean_exit_but_month_not_done_returns_1(self):
         """supervisor 乾淨退場但當月 run 尚未 success => 異常，回傳 1。"""
@@ -1823,13 +1913,14 @@ class TestCloakCookieFailClosed(unittest.TestCase):
         with (
             mock.patch("src.cloak._launch_cloak", side_effect=self._write_export(["PHPSESSID"])),
             mock.patch("src.cloak._mark_refresh_failed") as fail,
-            mock.patch("src.cloak._kill_browsers"),
+            mock.patch("src.cloak._stop_owned_browser") as stop,
             mock.patch("src.cloak.save_cookies") as save,
         ):
             out = cloak._refresh_impl()
             self.assertIsNone(out)
             fail.assert_called_once()
             save.assert_not_called()
+            self.assertEqual(stop.call_count, 2)
 
     def test_with_cf_clearance_succeeds(self):
         with (
@@ -1838,13 +1929,121 @@ class TestCloakCookieFailClosed(unittest.TestCase):
                 side_effect=self._write_export(["PHPSESSID", "cf_clearance"]),
             ),
             mock.patch("src.cloak._mark_refresh_failed") as fail,
-            mock.patch("src.cloak._kill_browsers"),
+            mock.patch("src.cloak._stop_owned_browser") as stop,
             mock.patch("src.cloak.save_cookies") as save,
         ):
             out = cloak._refresh_impl()
             self.assertIsNotNone(out)
             save.assert_called_once()
             fail.assert_not_called()
+            self.assertEqual(stop.call_count, 2)
+
+    def test_export_timeout_cleans_owned_browser(self):
+        with (
+            mock.patch("src.cloak._launch_cloak", return_value=True),
+            mock.patch("src.cloak._mark_refresh_failed") as fail,
+            mock.patch("src.cloak._stop_owned_browser") as stop,
+            mock.patch("src.cloak.COOKIE_EXPORT_TIMEOUT", 0),
+        ):
+            self.assertIsNone(cloak._refresh_impl())
+            fail.assert_called_once()
+            self.assertEqual(stop.call_count, 2)
+
+    def test_launch_exception_still_cleans_owned_browser(self):
+        with (
+            mock.patch("src.cloak._launch_cloak", side_effect=RuntimeError("boom")),
+            mock.patch("src.cloak._stop_owned_browser") as stop,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                cloak._refresh_impl()
+            self.assertEqual(stop.call_count, 2)
+
+    def test_save_exception_still_cleans_owned_browser(self):
+        with (
+            mock.patch(
+                "src.cloak._launch_cloak",
+                side_effect=self._write_export(["PHPSESSID", "cf_clearance"]),
+            ),
+            mock.patch("src.cloak._stop_owned_browser") as stop,
+            mock.patch("src.cloak.save_cookies", side_effect=RuntimeError("disk full")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                cloak._refresh_impl()
+            self.assertEqual(stop.call_count, 2)
+
+
+class TestCloakOwnedBrowserLifecycle(unittest.TestCase):
+    """Browser cleanup 只能操作本次 Popen 建立的 process group。"""
+
+    def tearDown(self):
+        with cloak._BROWSER_LOCK:
+            cloak._browser_proc = None
+            cloak._browser_err_log = None
+
+    def test_cleanup_targets_owned_process_group_and_is_idempotent(self):
+        proc = mock.MagicMock(pid=43210)
+        proc.poll.return_value = None
+        err_log = mock.MagicMock()
+        with cloak._BROWSER_LOCK:
+            cloak._browser_proc = proc
+            cloak._browser_err_log = err_log
+
+        with (
+            mock.patch("src.cloak.os.killpg") as killpg,
+            mock.patch("src.cloak.subprocess.run") as run,
+        ):
+            cloak._stop_owned_browser()
+            cloak._stop_owned_browser()
+
+        killpg.assert_called_once_with(43210, cloak.signal.SIGTERM)
+        proc.wait.assert_called_once_with(timeout=5)
+        err_log.close.assert_called_once()
+        run.assert_not_called()
+
+    def test_cleanup_does_not_signal_already_exited_process(self):
+        proc = mock.MagicMock(pid=43212)
+        proc.poll.return_value = 0
+        err_log = mock.MagicMock()
+        with cloak._BROWSER_LOCK:
+            cloak._browser_proc = proc
+            cloak._browser_err_log = err_log
+
+        with mock.patch("src.cloak.os.killpg") as killpg:
+            cloak._stop_owned_browser()
+
+        killpg.assert_not_called()
+        proc.terminate.assert_not_called()
+        err_log.close.assert_called_once()
+
+    def test_launch_timeout_registers_and_cleans_owned_process(self):
+        proc = mock.MagicMock(pid=43211, returncode=None)
+        proc.poll.return_value = None
+        err_log = mock.MagicMock()
+        with (
+            mock.patch("builtins.open", return_value=err_log),
+            mock.patch("src.cloak.subprocess.Popen", return_value=proc) as popen,
+            mock.patch("src.cloak.os.killpg") as killpg,
+            mock.patch("src.cloak._cdp_alive", return_value=False),
+            mock.patch("src.cloak.CDP_START_TIMEOUT", 0),
+        ):
+            self.assertFalse(cloak._launch_cloak())
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        child_script = popen.call_args.args[0][-1]
+        self.assertIn("await b.close()", child_script)
+        self.assertNotIn("while True", child_script)
+        killpg.assert_called_once_with(43211, cloak.signal.SIGTERM)
+        err_log.close.assert_called_once()
+
+    def test_unowned_cdp_port_is_not_killed(self):
+        with (
+            mock.patch("src.cloak._cdp_alive", return_value=True),
+            mock.patch("src.cloak.subprocess.Popen") as popen,
+            mock.patch("src.cloak.os.killpg") as killpg,
+        ):
+            self.assertFalse(cloak._launch_cloak())
+        popen.assert_not_called()
+        killpg.assert_not_called()
 
 
 class TestNoBrowserMode(unittest.TestCase):
@@ -2043,6 +2242,23 @@ class TestRequestGovernor(unittest.TestCase):
         t0 = time.monotonic()
         g.acquire()
         self.assertGreaterEqual(time.monotonic() - t0, 0.4, "throttle 期間不得發請求")
+
+    def test_throttle_resumes_with_one_token_not_full_burst(self):
+        """長 cooldown 不得把 bucket 填滿後同時釋放所有 workers。"""
+        with mock.patch("src.governor.time.monotonic", return_value=100.0):
+            g = RequestGovernor(rate=10, burst=4)
+            g.throttle(20)
+
+        self.assertEqual(g._tokens, 1.0)
+        self.assertEqual(g._last, 120.0)
+        with mock.patch("src.governor.time.monotonic", return_value=120.0):
+            g.acquire()
+        self.assertEqual(g._tokens, 0.0)
+
+        # cooldown 解除 0.05 秒後只補 0.5 token，不會憑空恢復 burst=4。
+        with g._cond:
+            g._refill(120.05)
+        self.assertAlmostEqual(g._tokens, 0.5)
 
     def test_slow_reduces_rate(self):
         """slow 後速率砍半（token 重生更慢，acquire 需等待更久）。"""

@@ -71,10 +71,44 @@ def _is_partsouq_endpoint(url: str, path: str) -> bool:
     return parsed.path.rstrip("/") == path
 
 
+def _candidate_identity(
+    url: str,
+    *keys: str,
+    required: tuple[str, ...] = (),
+) -> tuple:
+    """以 request context 對 canonical link 去重；缺欄時保留原網址。"""
+    params = {key: _qs(url, key) for key in keys}
+    values = tuple(params[key] for key in keys)
+    if not any(values) or any(params[key] is None for key in required):
+        return (*values, url)
+    return values
+
+
+def _context_mismatch(
+    url: str,
+    key: str,
+    expected: str | None,
+    *,
+    allow_missing: bool = False,
+) -> bool:
+    """已知 request context 時拒絕外來值；可相容省略 brand 的舊連結。"""
+    if expected is None:
+        return False
+    actual = _qs(url, key)
+    if actual is None:
+        return not allow_missing
+    return actual != str(expected)
+
+
 # ---------------------------------------------------------------- locate
 
 
-def parse_brand_index(html: str, brand: str, soup=None) -> list[dict]:
+def parse_brand_index(
+    html: str,
+    brand: str,
+    soup=None,
+    diagnostics: bool = False,
+) -> list[dict] | tuple[list[dict], int]:
     """解析 locate 頁面 → 型號清單（含 pick 網址）。
 
     每個型號是手風琴 <h4> 標題，內含連結到
@@ -82,13 +116,20 @@ def parse_brand_index(html: str, brand: str, soup=None) -> list[dict]:
     """
     soup = soup if soup is not None else _soup(html)
     models = []
+    candidates = set()
+    valid_candidates = set()
     for a in soup.select("a[href]"):
         href = _abs(a.get("href", ""))
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/pick"):
             continue
+        candidate = _candidate_identity(href, "c", "model", "ssd", required=("model",))
+        candidates.add(candidate)
+        if _context_mismatch(href, "c", brand, allow_missing=True):
+            continue
         name = a.get_text(strip=True)
         if not name or not href:
             continue
+        valid_candidates.add(candidate)
         params = parse_qs(urlparse(href).query)
         models.append(
             {
@@ -97,10 +138,16 @@ def parse_brand_index(html: str, brand: str, soup=None) -> list[dict]:
                 "url": href,
             }
         )
+    if diagnostics:
+        return models, len(candidates - valid_candidates)
     return models
 
 
-def parse_brands(html: str, soup=None) -> list[dict]:
+def parse_brands(
+    html: str,
+    soup=None,
+    diagnostics: bool = False,
+) -> list[dict] | tuple[list[dict], int]:
     """解析原廠目錄首頁 → 品牌清單（含代碼）。
 
     品牌位於側邊欄：<a href="/en/catalog/genuine/locate?c=NAME">
@@ -110,17 +157,25 @@ def parse_brands(html: str, soup=None) -> list[dict]:
     soup = soup if soup is not None else _soup(html)
     brands = []
     seen = set()
+    candidates = set()
+    valid_candidates = set()
     for a in soup.select("li a[href]"):
         href = _abs(a.get("href", ""))
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/locate"):
             continue
+        candidate = _candidate_identity(href, "c", required=("c",))
+        candidates.add(candidate)
+        code = _qs(href, "c")
         name = a.get_text(strip=True)
-        if not name or not href:
+        if not code or not name:
             continue
+        valid_candidates.add(candidate)
         if name in seen:
             continue
         seen.add(name)
         brands.append({"name": name, "url": href})
+    if diagnostics:
+        return brands, len(candidates - valid_candidates)
     return brands
 
 
@@ -171,7 +226,12 @@ def _vehicle_fields(th_classes, th_text):
     return None
 
 
-def parse_vehicles(html: str, brand: str, soup=None) -> list[dict]:
+def parse_vehicles(
+    html: str,
+    brand: str,
+    soup=None,
+    diagnostics: bool = False,
+) -> list[dict] | tuple[list[dict], int]:
     """解析 pick 頁面的規格表 → 車型清單。
 
     欄位隨品牌與表格而異（部分品牌多了 Engine / Body Style / Grade /
@@ -180,6 +240,15 @@ def parse_vehicles(html: str, brand: str, soup=None) -> list[dict]:
     """
     soup = soup if soup is not None else _soup(html)
     vehicles = []
+    malformed = 0
+    candidates = set()
+    valid_candidates = set()
+    candidate_specs = {}
+    for a in soup.select("a[href]"):
+        href = _abs(a.get("href", ""))
+        if _is_partsouq_endpoint(href, "/en/catalog/genuine/vehicle"):
+            candidates.add(_candidate_identity(href, "c", "ssd", "vid"))
+
     for table in soup.select("table"):
         rows = table.select("tr")
         if not rows:
@@ -205,9 +274,14 @@ def parse_vehicles(html: str, brand: str, soup=None) -> list[dict]:
                 for a in tr.select("a[href]")
                 if _is_partsouq_endpoint(_abs(a.get("href", "")), "/en/catalog/genuine/vehicle")
             ]
-            if not links:
+            matching_links = [
+                a
+                for a in links
+                if not _context_mismatch(_abs(a.get("href", "")), "c", brand, allow_missing=True)
+            ]
+            if not matching_links:
                 continue
-            url = _abs(links[0].get("href"))
+            url = _abs(matching_links[0].get("href"))
             rec = {
                 "name": "",
                 "description": "",
@@ -225,33 +299,46 @@ def parse_vehicles(html: str, brand: str, soup=None) -> list[dict]:
             rec["ssd"] = _qs(url, "ssd")
             rec["vid"] = _qs(url, "vid")
             rec["url"] = url
-            vehicles.append(rec)
+            key = tuple(
+                str(rec.get(field) or "")
+                for field in (
+                    "model_code",
+                    "name",
+                    "description",
+                    "options",
+                    "prod_period",
+                    "grade",
+                    "market",
+                    "engine",
+                    "transmission",
+                    "body_style",
+                )
+            )
+            if not any(key):
+                continue
+            row_candidates = {
+                _candidate_identity(_abs(a.get("href", "")), "c", "ssd", "vid")
+                for a in matching_links
+            }
+            for candidate in row_candidates:
+                if candidate in candidate_specs and candidate_specs[candidate] != key:
+                    malformed += 1
+                    continue
+                candidate_specs[candidate] = key
+                valid_candidates.add(candidate)
+            vehicles.append((rec, key))
     # ssd / vid / url 是請求用 token，不是車型身分。若依 ssd 去重，
     # 同 token 的不同規格會靜默消失；改以 parser 已辨識的穩定規格去重。
     seen = set()
     out = []
-    for v in vehicles:
-        key = tuple(
-            str(v.get(field) or "")
-            for field in (
-                "model_code",
-                "name",
-                "description",
-                "options",
-                "prod_period",
-                "grade",
-                "market",
-                "engine",
-                "transmission",
-                "body_style",
-            )
-        )
-        if not any(key):
-            continue
+    for vehicle, key in vehicles:
         if key in seen:
             continue
         seen.add(key)
-        out.append(v)
+        out.append(vehicle)
+    malformed += len(candidates - valid_candidates)
+    if diagnostics:
+        return out, malformed
     return out
 
 
@@ -263,6 +350,8 @@ def parse_category_links(
     brand: str,
     soup=None,
     diagnostics: bool = False,
+    expected_ssd: str | None = None,
+    expected_vid: str | None = None,
 ) -> list[dict] | tuple[list[dict], int]:
     """解析 vehicle 頁面 → 分類導覽連結。
 
@@ -279,11 +368,24 @@ def parse_category_links(
         href = _abs(a.get("href", ""))
         if not _is_partsouq_endpoint(href, "/en/catalog/genuine/vehicle"):
             continue
+        candidate = _candidate_identity(
+            href,
+            "c",
+            "ssd",
+            "vid",
+            "cid",
+            required=("cid",),
+        )
+        candidates.add(candidate)
+        if (
+            _context_mismatch(href, "c", brand, allow_missing=True)
+            or _context_mismatch(href, "ssd", expected_ssd)
+            or _context_mismatch(href, "vid", expected_vid)
+        ):
+            continue
         cid = _qs(href, "cid")
         if not cid:
-            malformed += 1
             continue
-        candidates.add(cid)
         text = a.get_text(strip=True)
         if not text:
             # 同一 cid 可能同時有圖片與文字 anchor；最後以 cid
@@ -294,9 +396,11 @@ def parse_category_links(
         if cid in seen:
             if seen[cid] != name:
                 malformed += 1
+            else:
+                valid_candidates.add(candidate)
             continue
         seen[cid] = name
-        valid_candidates.add(cid)
+        valid_candidates.add(candidate)
         cats.append(
             {
                 "category_name": name,
@@ -318,6 +422,9 @@ def parse_groups(
     default_cid: str = "1",
     soup=None,
     diagnostics: bool = False,
+    expected_ssd: str | None = None,
+    expected_vid: str | None = None,
+    expected_cid: str | None = None,
 ) -> list[dict] | tuple[list[dict], int]:
     """解析 vehicle 頁面 → 零件組連結（NNNN: NAME → /unit?...）。
 
@@ -339,11 +446,25 @@ def parse_groups(
             continue
         cid = _qs(href, "cid") or default_cid
         uid = _qs(href, "uid")
-        if not uid:
-            malformed += 1
-            continue
-        candidate = (cid, uid)
+        candidate = _candidate_identity(
+            href,
+            "c",
+            "ssd",
+            "vid",
+            "cid",
+            "uid",
+            required=("uid",),
+        )
         candidates.add(candidate)
+        if (
+            _context_mismatch(href, "c", brand, allow_missing=True)
+            or _context_mismatch(href, "ssd", expected_ssd)
+            or _context_mismatch(href, "vid", expected_vid)
+            or (expected_cid is not None and cid != str(expected_cid))
+        ):
+            continue
+        if not uid:
+            continue
         text = a.get_text(strip=True)
         if not text:
             # 圖片與文字可能同時連到同一組；最後以 cid+uid 對帳，只有
@@ -407,11 +528,10 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
     回傳 (parts, malformed)：
     - parts：結構完整（6 欄：Number|Name|Code|Note|Quantity|Range）
       的零件列。第一格有搜尋連結但欄數不足的列**不算零件**。
-    - malformed：異常 candidate 列數 —— 第一格有搜尋連結但料號為空、
-      或 `len(cells) < 6`（結構缺欄）的列。這代表頁面版型異常（或反爬
-      變體）仍解析出「看似零件」的殘缺列 —— 呼叫端（crawl_group）必須
-      因此拒絕寫 terminal receipt，否則缺欄列以 NULL 落庫後該組
-      本月不再重抓，缺漏被固定（SOL P1）。
+    - malformed：異常 candidate 列數 —— 欄數不是 6、搜尋網址非
+      PartSouq `/en/search/all`、q 為空，或顯示料號與 q 不同。這代表
+      頁面版型異常（或反爬變體）仍解析出「看似零件」的殘缺列；呼叫端
+      必須拒絕寫 terminal receipt。
     """
     soup = soup if soup is not None else _soup(html)
     parts_by_key = {}
@@ -435,22 +555,32 @@ def parse_parts(html: str, soup=None) -> tuple[list[dict], int]:
             tds = tr.find_all("td", recursive=False)
             if not tds:
                 continue
-            # 搜尋連結必須在第一格：第一格的 <a href*=/search/all?>。
-            # 若整列只有別的位置有連結，或完全沒有，都不是零件列。
-            first_td_link = tds[0].select("a[href*='/search/all?']")
-            if not first_td_link:
+            # 先以 endpoint path 辨認 candidate，讓同路徑的外站網址也會
+            # 被回報 malformed，而不是靜默忽略。
+            search_links = []
+            for a in tds[0].select("a[href]"):
+                href = _abs(a.get("href", ""))
+                if urlparse(href).path.rstrip("/") == "/en/search/all":
+                    search_links.append(href)
+            if not search_links:
+                continue
+            if len(tds) != 6:
+                malformed += 1
                 continue
             cells = [td.get_text(strip=True) for td in tds]
             part_number = cells[0]
-            if not part_number:
-                # 第一格有搜尋連結但料號是空的：異常列（連結的 q= 也是空），
-                # 計入 malformed 由呼叫端拒絕 receipt（SOL P1：不無聲吞掉）。
-                malformed += 1
-                continue
-            if len(cells) < 6:
-                # 結構缺欄（SOL P1）：只給料號或其他欄位不足 = 版型
-                # 異常/反爬變體，不是合法零件列。回報 malformed，
-                # 由呼叫端拒絕寫 terminal receipt。
+            queries = set()
+            valid_links = True
+            for href in search_links:
+                if not _is_partsouq_endpoint(href, "/en/search/all"):
+                    valid_links = False
+                    break
+                query = _qs(href, "q")
+                if not query:
+                    valid_links = False
+                    break
+                queries.add(query)
+            if not valid_links or len(queries) != 1 or part_number not in queries:
                 malformed += 1
                 continue
             part = {

@@ -7,6 +7,7 @@
   4. 爬取完成 -> 乾淨退出
 """
 
+import json
 import signal
 import tempfile
 import time
@@ -66,7 +67,11 @@ class TestSupervisorLoop(unittest.TestCase):
         # 第 1 次呼叫：心跳查詢回傳過期時間；第 2 次：run 狀態 -> 執行中
         self.sup.db.query_one.side_effect = [{"last_write": old}, {"status": "running"}]
         self.sup.proc = FakeProc(poll_result=None)  # 程序活著但卡住
-        with mock.patch.object(self.sup, "restart") as restart:
+        self.sup.crawler_started_at = time.monotonic() - HANG_TIMEOUT - 1
+        with (
+            mock.patch.object(self.sup, "_kill_other_crawlers", return_value=True),
+            mock.patch.object(self.sup, "restart") as restart,
+        ):
             self.sup._tick()
             restart.assert_called_once()
 
@@ -107,7 +112,11 @@ class TestSupervisorLoop(unittest.TestCase):
         self.sup.db = mock.MagicMock()
         self.sup.db.query_one.return_value = {"status": "running"}
         self.sup.proc = FakeProc(poll_result=None)  # 存活但卡死的 child
-        with mock.patch.object(self.sup, "start") as start:
+        self.sup.crawler_started_at = time.monotonic() - HANG_TIMEOUT - 1
+        with (
+            mock.patch.object(self.sup, "_kill_other_crawlers", return_value=True),
+            mock.patch.object(self.sup, "start") as start,
+        ):
             self.sup._tick()
         self.assertGreater(self.sup.cooldown_until, now, "週期性重啟也必須在 4 次內累積到冷卻")
         start.assert_not_called()
@@ -155,6 +164,131 @@ class TestSupervisorLoop(unittest.TestCase):
         with mock.patch.object(self.sup, "_kill_current", return_value=True) as kill:
             self.sup._tick()
         kill.assert_called_once_with("cooldown active")
+
+    def test_restart_state_resumes_history_and_cooldown_in_new_instance(self):
+        """restart storm 必須跨 Supervisor 程序保留，不可用重啟繞過。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "supervisor_state.json"
+            with (
+                mock.patch("src.supervisor.time.time", return_value=10_000.0),
+                mock.patch("src.supervisor.time.monotonic", return_value=5_000.0),
+            ):
+                first = Supervisor(workers=4)
+                first.restart_state_path = state_path
+                first._load_restart_state()
+                first.restarts = [4_970.0, 4_980.0, 4_990.0]
+                first.proc = FakeProc(poll_result=None)
+                with mock.patch.object(first, "_kill_current", return_value=True):
+                    first.restart("fourth failure")
+
+                second = Supervisor(workers=4)
+                second.restart_state_path = state_path
+                second._load_restart_state()
+
+                self.assertEqual(second.restarts, [4_970.0, 4_980.0, 4_990.0, 5_000.0])
+                self.assertEqual(second.cooldown_until, 5_000.0 + supervisor_module.COOLDOWN)
+                with (
+                    mock.patch.object(second, "_kill_other_crawlers", return_value=True),
+                    mock.patch.object(second, "start") as start,
+                ):
+                    second._tick_inner()
+                start.assert_not_called()
+
+    def test_run_honors_restored_cooldown_before_first_start(self):
+        """run() 啟動初期也必須先遵守磁碟上的 cooldown。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "supervisor_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "restart_times": [9_970.0, 9_980.0, 9_990.0, 10_000.0],
+                        "cooldown_until": 10_600.0,
+                    }
+                )
+            )
+            restored = Supervisor(workers=4)
+            restored.restart_state_path = state_path
+            fake_db = mock.MagicMock()
+            with (
+                mock.patch("src.supervisor.time.time", return_value=10_000.0),
+                mock.patch("src.supervisor.time.monotonic", return_value=5_000.0),
+                mock.patch("src.supervisor.Database.connect", return_value=fake_db),
+                mock.patch.object(restored, "_cleanup_stale_runs"),
+                mock.patch.object(restored, "_crawl_done", return_value=False),
+                mock.patch.object(restored, "_kill_other_crawlers", return_value=True),
+                mock.patch.object(restored, "start") as start,
+                mock.patch("src.supervisor.time.sleep", side_effect=RuntimeError("stop loop")),
+                self.assertRaisesRegex(RuntimeError, "stop loop"),
+            ):
+                restored.run()
+            start.assert_not_called()
+            fake_db.close.assert_called_once()
+
+    def test_missing_and_corrupted_restart_state_do_not_crash(self):
+        """首次啟動或狀態檔損毀時，保留 supervisor 可用性。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "supervisor_state.json"
+            missing = Supervisor(workers=4)
+            missing.restart_state_path = state_path
+            missing._load_restart_state()
+            self.assertEqual(missing.restarts, [])
+            self.assertEqual(missing.cooldown_until, 0.0)
+
+            state_path.write_text("{broken json")
+            corrupted = Supervisor(workers=4)
+            corrupted.restart_state_path = state_path
+            with self.assertLogs("supervisor", level="WARNING"):
+                corrupted._load_restart_state()
+            self.assertEqual(corrupted.restarts, [])
+            self.assertEqual(corrupted.cooldown_until, 0.0)
+            repaired = json.loads(state_path.read_text())
+            self.assertEqual(repaired["restart_times"], [])
+            self.assertEqual(repaired["cooldown_until"], 0)
+
+            # 合法 JSON 也可能含無法轉成 float 的超大整數，仍不得讓
+            # supervisor 啟動失敗。
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "restart_times": [10**4000],
+                        "cooldown_until": 0,
+                    }
+                )
+            )
+            overflowed = Supervisor(workers=4)
+            overflowed.restart_state_path = state_path
+            with self.assertLogs("supervisor", level="WARNING"):
+                overflowed._load_restart_state()
+            self.assertEqual(overflowed.restarts, [])
+            self.assertEqual(overflowed.cooldown_until, 0.0)
+
+    def test_expired_persisted_cooldown_clears_restart_history(self):
+        """正常結束 cooldown 後，下一次錯誤不應立刻再次進 cooldown。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "supervisor_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "restart_times": [9_900.0, 9_950.0, 9_990.0, 9_995.0],
+                        "cooldown_until": 9_999.0,
+                    }
+                )
+            )
+            with (
+                mock.patch("src.supervisor.time.time", return_value=10_000.0),
+                mock.patch("src.supervisor.time.monotonic", return_value=5_000.0),
+            ):
+                restored = Supervisor(workers=4)
+                restored.restart_state_path = state_path
+                restored._load_restart_state()
+            self.assertEqual(restored.restarts, [])
+            self.assertEqual(restored.cooldown_until, 0.0)
+            cleared = json.loads(state_path.read_text())
+            self.assertEqual(cleared["restart_times"], [])
+            self.assertEqual(cleared["cooldown_until"], 0)
 
     def test_start_refuses_when_stray_kill_is_unconfirmed(self):
         with (
@@ -295,6 +429,7 @@ class TestSupervisorLoop(unittest.TestCase):
 
         with (
             mock.patch("src.supervisor.Database.connect", return_value=fake_db),
+            mock.patch.object(self.sup, "_load_restart_state"),
             mock.patch.object(self.sup, "_cleanup_stale_runs"),
             mock.patch.object(self.sup, "_crawl_done", return_value=False),
             mock.patch.object(self.sup, "start", side_effect=RuntimeError("boom")),

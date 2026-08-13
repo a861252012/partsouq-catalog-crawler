@@ -196,7 +196,38 @@ class Crawler:
         html = self.http.get(SITE["genuine"])
         from .parsers import parse_brands
 
-        return parse_brands(html)
+        brands, malformed = parse_brands(html, diagnostics=True)
+        if malformed:
+            raise RuntimeError(
+                f"brand index contains {malformed} malformed canonical link(s); "
+                "refusing partial catalog"
+            )
+        return brands
+
+    def _check_capacity(self, run_key: str):
+        """在網路請求前記錄已知工作的最低容量需求。
+
+        每個尚未 receipted 的既有 group 至少需要一次 unit request；階層頁、
+        新 group、retry 與休息只會增加成本。25 天目前是單一 supervisor
+        process 的防呆時限，重啟後會重算；因此這裡只提供可觀測的下限
+        與 warning，不把它誤當成跨重啟的硬 SLA。
+        """
+        remaining = int(self.crawl.remaining_group_count(run_key) or 0)
+        rate = float(CRAWL["request_rate"])
+        deadline_seconds = float(CRAWL["max_run_days"]) * 24 * 3600
+        optimistic_budget = int(CRAWL["request_burst"]) + rate * deadline_seconds
+        minimum_days = remaining / rate / 86400 if remaining else 0.0
+        message = (
+            f"capacity lower bound: {remaining} known remaining unit request(s), "
+            f"at least {minimum_days:.1f} day(s) at {rate:g} request/s; "
+            f"single-process budget={optimistic_budget:.0f}"
+        )
+        if remaining > optimistic_budget:
+            log.warning(
+                "%s; completion within %.1f days is not feasible", message, CRAWL["max_run_days"]
+            )
+        else:
+            log.info(message)
 
     # -------------------------------------------------------------- brands
 
@@ -209,7 +240,11 @@ class Crawler:
         """
         locate_url = SITE["locate"].format(brand=urllib.parse.quote(brand))
         html = self._get(locate_url)
-        models = parse_brand_index(html, brand)
+        models, malformed = parse_brand_index(html, brand, diagnostics=True)
+        if malformed:
+            raise RuntimeError(
+                f"[{brand}] {malformed} malformed canonical model link(s); refusing partial catalog"
+            )
         self._guard_parse(html, models, "models", brand)
         log.info("[%s] %d models", brand, len(models))
 
@@ -346,7 +381,12 @@ class Crawler:
             ssd=urllib.parse.quote(model["ssd"] or ""),
         )
         html = self._get(pick_url)
-        vehicles = parse_vehicles(html, brand)
+        vehicles, malformed = parse_vehicles(html, brand, diagnostics=True)
+        if malformed:
+            raise RuntimeError(
+                f"[{brand}/{model['name']}] {malformed} malformed canonical "
+                "vehicle link(s); refusing partial catalog"
+            )
         log.info("  [%s] %d vehicles", model["name"], len(vehicles))
         self._guard_parse(html, vehicles, "vehicles", model["name"])
 
@@ -516,6 +556,8 @@ class Crawler:
             brand=brand,
             soup=soup,
             diagnostics=True,
+            expected_ssd=ssd,
+            expected_vid=base_vid,
         )
         if malformed_categories:
             raise RuntimeError(
@@ -545,6 +587,7 @@ class Crawler:
         # SOL review P1：上一 run 的 row_count map —— 本次解析到的
         # 零件數相較前次大幅縮水（格式完整但內容縮水）時拒絕 receipt。
         prev_rows = self.crawl.previous_row_count_map(vehicle_id, self.crawl.run_key or "")
+        category_ids = {}
         truncated = self.crawl_groups(
             brand,
             vehicle_id,
@@ -554,6 +597,9 @@ class Crawler:
             skip=True,
             fetched=fetched,
             prev_rows=prev_rows,
+            category_ids=category_ids,
+            expected_ssd=ssd,
+            expected_vid=base_vid,
         )
 
         for category in categories[1:]:
@@ -571,6 +617,9 @@ class Crawler:
                 skip=True,
                 fetched=fetched,
                 prev_rows=prev_rows,
+                category_ids=category_ids,
+                expected_ssd=str(category.get("ssd") or ssd),
+                expected_vid=str(category.get("vid") or base_vid),
             )
 
         # SOL review P1：分類縮水對帳 —— DB 已知但本次完全沒解析到的
@@ -606,6 +655,9 @@ class Crawler:
         skip=False,
         fetched=None,
         prev_rows=None,
+        category_ids=None,
+        expected_ssd=None,
+        expected_vid=None,
     ) -> int:
         """解析一頁 HTML 內的所有零件組並逐一爬取。回傳被 limit_groups
         截斷而未爬取的零件組數。
@@ -625,6 +677,9 @@ class Crawler:
             default_cid=default_cid,
             soup=soup,
             diagnostics=True,
+            expected_ssd=expected_ssd,
+            expected_vid=expected_vid,
+            expected_cid=default_cid,
         )
         if malformed:
             raise RuntimeError(
@@ -668,6 +723,7 @@ class Crawler:
                 skip_if_fetched=skip,
                 fetched=fetched,
                 prev_rows=prev_rows,
+                category_ids=category_ids,
             )
         return truncated
 
@@ -679,6 +735,7 @@ class Crawler:
         skip_if_fetched: bool = False,
         fetched=None,
         prev_rows=None,
+        category_ids=None,
     ):
         """爬取單一零件組：寫入分類/零件組 → 爬取零件明細。
 
@@ -735,7 +792,13 @@ class Crawler:
                 return
 
         category_name = group["category_name"]
-        category_id = self.vehicles.upsert_category(vehicle_id, category_name, group["cid"])
+        category_key = str(group.get("cid") or category_name)
+        if category_ids is not None and category_key in category_ids:
+            category_id = category_ids[category_key]
+        else:
+            category_id = self.vehicles.upsert_category(vehicle_id, category_name, group["cid"])
+            if category_ids is not None:
+                category_ids[category_key] = category_id
         group_id = self.vehicles.upsert_group(
             category_id,
             group["group_code"],
@@ -758,11 +821,15 @@ class Crawler:
             # F5：status='not_found'，續爬不再重抓 404 組。
             if self.run_id is None:
                 raise RuntimeError("crawl run is not initialized") from None
-            self.parts.clear_group_membership(group_id)
-            self.crawl.mark_group_fetched(group_id, run_key, status="not_found")
+            try:
+                self.parts.clear_group_membership(group_id)
+                self.crawl.mark_group_fetched(group_id, run_key, status="not_found")
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
             if fetched is not None:
                 fetched[map_key] = 0
-            self.db.commit()
             return
         parts, malformed = parse_parts(html)
         # SOL P1：結構缺欄/空料號的 candidate 列代表版型異常或反爬變體，
@@ -822,25 +889,26 @@ class Crawler:
                 self.crawl.mark_group_fetched(
                     group_id, run_key, status="done", row_count=len(parts)
                 )
+                self.db.commit()
                 if fetched is not None:
                     fetched[map_key] = len(parts)
-                self.db.commit()
                 # 計數在 commit 成功後才累加：重跑時不重複計。
                 self._bump("parts", len(parts))
                 self._bump("parts_new", new)
                 break
             except pymysql.err.OperationalError as e:
                 code = e.args[0] if e.args else None
+                self.db.rollback()
                 if code in (1205, 1213) and attempt == 1:
                     log.warning(
                         "[%s group=%s] deadlock writing parts; retrying once",
                         brand,
                         group.get("group_code"),
                     )
-                    self.db.rollback()
                     continue
                 raise
             except ConnectionLost:
+                self.db.rollback()
                 if attempt == 1:
                     log.warning(
                         "[%s group=%s] connection lost writing parts; retrying full block once",
@@ -848,6 +916,9 @@ class Crawler:
                         group.get("group_code"),
                     )
                     continue
+                raise
+            except Exception:
+                self.db.rollback()
                 raise
 
     # ------------------------------------------------------------- entry
@@ -908,6 +979,7 @@ class Crawler:
             log.exception("legacy state purge failed; continuing")
         finalizing = False
         try:
+            self._check_capacity(run_key)
             brands = self._brands()
             if not brands:
                 # 首頁解析出 0 個品牌：網站可能改版或回應異常，

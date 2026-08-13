@@ -1,9 +1,9 @@
 """每小時健康檢查（watchdog）：確保爬蟲永遠有在跑，死了就拉回來。
 
 由 launchd 每小時觸發一次。做的事：
-  1. supervisor 還活著嗎？    沒有 → 重新啟動
-  2. 爬蟲子程序還活著嗎？     沒有 → 由 supervisor 處理（這裡只記錄）
-  3. DB 還回應嗎？            SELECT 1 + MAX(updated_at) FROM parts
+  1. DB 還回應嗎？            SELECT 1
+  2. 當月是否已完成？          已完成 → 不重啟、不做 stale-write 判斷
+  3. supervisor 還活著嗎？    未完成且沒有 → 重新啟動
   4. 進度有沒有卡住？         距離上次成功寫入 > HANG_TIMEOUT → 記錄警訊
   5. 全部結果寫入 logs/watchdog.log（人類可讀 + 一行摘要）
 
@@ -128,14 +128,37 @@ def main() -> int:
         "last_write": None,
         "parts_count": None,
         "stalled": False,
+        "completed": False,
     }
 
-    # 1. supervisor 存活
+    # 1. 先確認 DB 與當月完成狀態。已完成的 supervisor/crawler 正常會
+    # 退場，必須在 spawn 與 stale-write 判斷之前辨識。
+    alive = _mysql(["-e", "SELECT 1 AS x"])
+    status["db_alive"] = bool(alive)
+    crawl_done = bool(alive and _month_crawl_done())
+    status["completed"] = crawl_done
+    if crawl_done:
+        run_key = _dt.datetime.now().strftime("%Y-%m")
+        persisted_count = _mysql(
+            [
+                "-N",
+                "-e",
+                "SELECT parts_ok FROM crawl_runs "
+                f"WHERE run_key='{run_key}' AND status='success' LIMIT 1",
+            ]
+        )
+        if persisted_count and persisted_count != "NULL":
+            status["parts_count"] = persisted_count
+
+    # 2. supervisor 存活
     sup_alive = _is_running("supervisor")
     status["supervisor"] = bool(sup_alive)
     sup_was_down = not sup_alive
-    clean_done_exit = False
-    if not sup_alive:
+    if not sup_alive and crawl_done:
+        _log("supervisor not running (current month already complete)")
+    elif not sup_alive and not alive:
+        _log("supervisor NOT running; DB unavailable, skipping restart", "ERROR")
+    elif not sup_alive:
         _log("supervisor NOT running — restarting", "WARN")
         try:
             proc = subprocess.Popen(
@@ -154,8 +177,9 @@ def main() -> int:
                     # supervisor 乾淨退場 = 當月爬取已完成，是健康狀態；
                     # crawler 不在是正常的。
                     _log("supervisor exited cleanly (crawl already complete)")
-                    sup_alive = True
-                    clean_done_exit = True
+                    crawl_done = True
+                    status["completed"] = True
+                    sup_alive = False
                 else:
                     _log(f"supervisor exited immediately (rc={proc.returncode})", "ERROR")
                     sup_alive = False
@@ -166,22 +190,19 @@ def main() -> int:
             sup_alive = False
         status["supervisor"] = bool(sup_alive)
 
-    # 2. crawler 存活（可能剛由 supervisor 帶起）
+    # 3. crawler 存活（可能剛由 supervisor 帶起）
     status["crawler"] = bool(_is_running("crawler"))
     # supervisor 在跑但 crawler 短暫不在 = 正在換代重啟，緩衝再確認一次
-    if sup_alive and not status["crawler"]:
+    if not crawl_done and sup_alive and not status["crawler"]:
         time.sleep(CRAWLER_RECHECK_SECONDS)
         status["crawler"] = bool(_is_running("crawler"))
 
-    # 3. DB 健康 + 進度
-    alive = _mysql(["-e", "SELECT 1 AS x"])
-    status["db_alive"] = bool(alive)
-    if alive:
-        row = _mysql(["-N", "-e", "SELECT MAX(updated_at), COUNT(*) FROM parts"])
-        if row:
-            parts = row.split("\t")
-            status["last_write"] = parts[0] if len(parts) > 0 else None
-            status["parts_count"] = parts[1] if len(parts) > 1 else None
+    # 4. 未完成時才檢查寫入進度。COUNT(*) 對大型 InnoDB 表是線性掃描，
+    # 每小時 health check 只讀有索引的最新時間；完成筆數沿用 crawl_runs。
+    if alive and not crawl_done:
+        row = _mysql(["-N", "-e", "SELECT MAX(updated_at) FROM parts"])
+        if row and row != "NULL":
+            status["last_write"] = row.split("\t", 1)[0]
             if status["last_write"]:
                 try:
                     last = _dt.datetime.fromisoformat(status["last_write"])
@@ -196,7 +217,7 @@ def main() -> int:
                 except ValueError:
                     pass
 
-    # 4. 摘要
+    # 5. 摘要
     try:
         (STATUS_FILE).write_text(json.dumps(status, indent=2, ensure_ascii=False))
     except OSError as e:
@@ -208,7 +229,8 @@ def main() -> int:
         f"db={'OK' if status['db_alive'] else 'DOWN'} "
         f"parts={status['parts_count'] or '?'} "
         f"last={status['last_write'] or '?'} "
-        f"stalled={'YES' if status['stalled'] else 'no'}"
+        f"stalled={'YES' if status['stalled'] else 'no'} "
+        f"completed={'YES' if status['completed'] else 'no'}"
     )
     _log(summary)
 
@@ -216,17 +238,15 @@ def main() -> int:
     #   0 = 完全健康；1 = 需要人工處理（supervisor 拉不起來、DB 掛、卡死）
     # sup_was_down 在 spawn「前」擷取，代表「這輪我們嘗試拉起過」：
     #   若 spawn 後 supervisor 仍起不來（status 仍 False）→ 異常，回 1；
-    #   若已成功拉起（status True）但 crawler 仍 DOWN（section 2 已給過
+    #   若已成功拉起（status True）但 crawler 仍 DOWN（section 3 已給過
     #     8 秒緩衝）→ 監督未能帶起 crawler，回 1（P1 修復：舊邏輯只檢查
     #     supervisor/DB/stalled，crawler DOWN 也會誤回 0 = 完全健康）；
     #   若 supervisor 本來就在、crawler 卻 DOWN → 監督失能，回 1。
+    if crawl_done:
+        return 0
+    if not status["db_alive"]:
+        return 1
     if sup_was_down:
-        if clean_done_exit:
-            # supervisor 因當月已完成而乾淨退場：crawler 不在是正常狀態，
-            # 只要 DB 健康且未卡死即回 0。
-            if status["stalled"] or not status["db_alive"]:
-                return 1
-            return 0
         if not status["supervisor"] or not status["crawler"]:
             return 1
         if status["stalled"] or not status["db_alive"]:

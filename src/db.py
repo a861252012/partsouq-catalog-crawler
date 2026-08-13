@@ -126,9 +126,16 @@ class Database:
                 raise
             if code in (2006, 2013):
                 self._raise_connection_lost(code)
+            self.rollback()
             raise
         except pymysql.err.InterfaceError:
             self._raise_connection_lost("InterfaceError")
+        except pymysql.MySQLError:
+            # DataError / IntegrityError 等一般 SQL 錯誤也可能發生在
+            # 多語句 transaction 中。若只把例外往上拋，thread-local
+            # connection 會保留前面尚未提交的寫入，下一個工作可能誤提交。
+            self.rollback()
+            raise
 
     def _raise_connection_lost(self, code):
         """斷線：捨棄目前執行緒的連線，並向服務層拋出 ConnectionLost。
@@ -249,6 +256,10 @@ class Database:
                 raise
             if code in (2006, 2013):
                 self._raise_connection_lost(code)
+            self.rollback()
             raise
         except pymysql.err.InterfaceError:
             self._raise_connection_lost("InterfaceError")
+        except pymysql.MySQLError:
+            self.rollback()
+            raise

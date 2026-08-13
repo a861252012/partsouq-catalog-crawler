@@ -73,7 +73,7 @@ GitHub repository **不包含**以下本機資料：
 
 ### 情境 A：新機從空資料庫重新爬
 
-使用 `schema.sql` 建立全新資料庫。**不要再執行 migrations 001–005**，因為 `schema.sql` 已是最新版。
+使用 `schema.sql` 建立全新資料庫。**不要再執行 migrations 001–006**，因為 `schema.sql` 已是最新版。
 
 ### 情境 B：把舊 Mac 的既有資料搬到新機
 
@@ -320,7 +320,7 @@ cd "$PROJECT_DIR"
 
 這一步使用 root，是因為 `schema.sql` 內含 `CREATE DATABASE IF NOT EXISTS`。Crawler 平常執行仍使用權限限縮在該 DB 的 `partsouq` 帳號。
 
-**全新 DB 到這裡就完成，不要再執行 migrations 001–005。**
+**全新 DB 到這裡就完成，不要再執行 migrations 001–006。**
 
 驗證 schema：
 
@@ -392,6 +392,12 @@ MYSQL_PWD="$PSQ_DB_PASS" "$MYSQLDUMP_BIN" \
 
 Crawler 與 supervisor 必須維持停止：
 
+Migration 001 會先針對實際 unique key 檢查 `NULL` 全部改成空字串後是否
+碰撞。只要其中一組碰撞就會在任何資料修改前停止，必須先人工合併；
+不得刪除 collision check 或暫時移除 unique key 硬跑。Migration 的
+metadata lock 與 InnoDB row lock 最多等待 30 秒，逾時通常代表還有 writer
+或長交易，確認完全停止後直接重跑即可。
+
 ```bash
 cd "$PROJECT_DIR"
 
@@ -414,6 +420,14 @@ done
 
 舊 schema 沒有保存完整的 vehicle identity 欄位。migration 005 可能刪除 normalized vehicle tree，接著由 crawler 重新抓取；`published_parts` 會保留上一份成功快照。
 
+005 會先把所有舊的 `success` run 標為 `error`，不依賴 DB 時區推算目前
+月份，避免重建後 crawler 因舊 success 直接退出。接著依
+`crawl_state -> parts -> groups_t -> categories -> vehicles`，每批 1,000 列
+刪除並 commit；
+若遇到 30 秒 lock timeout 或連線中斷，已完成的批次不會回滾，保持 crawler
+停止後重跑同一 migration 即可從剩餘資料繼續。這段期間 `v_parts` 仍讀取
+原本的 `published_parts`。
+
 只有在你已確認備份存在時才執行：
 
 ```bash
@@ -423,7 +437,22 @@ MYSQL_PWD="$PSQ_DB_PASS" "$MYSQL_BIN" \
   "$PSQ_DB_NAME" < migrations/005_vehicle_identity_v5_and_category_cid.sql
 ```
 
-驗證 migration：
+若 005 中斷，不要自行刪 index／column；保留錯誤輸出與備份，先查明再重跑。
+不要在中斷期間啟動 crawler。先用 `SHOW PROCESSLIST` 確認沒有 crawler writer
+或長交易，再以相同授權指令重跑；不要手動執行無 LIMIT 的
+`DELETE FROM vehicles`。
+
+005 完成後執行 group row-count high-water migration：
+
+```bash
+MYSQL_PWD="$PSQ_DB_PASS" "$MYSQL_BIN" \
+  -h "$PSQ_DB_HOST" -P "$PSQ_DB_PORT" -u "$PSQ_DB_USER" \
+  "$PSQ_DB_NAME" < migrations/006_group_high_water.sql
+```
+
+006 也可安全重跑。若回傳非 0，保持 crawler 停止並查明後再重跑。
+
+驗證 migrations：
 
 ```bash
 MYSQL_PWD="$PSQ_DB_PASS" "$MYSQL_BIN" \
@@ -433,11 +462,10 @@ MYSQL_PWD="$PSQ_DB_PASS" "$MYSQL_BIN" \
     SHOW INDEX FROM categories WHERE Key_name='uq_cat_cid';
     SHOW COLUMNS FROM vehicles LIKE 'body_style';
     SHOW COLUMNS FROM parts LIKE 'seen_run_id';
+    SHOW COLUMNS FROM groups_t LIKE 'verified_row_count';
     SELECT COUNT(*) AS published_parts_count FROM published_parts;
   "
 ```
-
-若 005 中斷，不要自行刪 index／column；保留錯誤輸出與備份，先查明再重跑。
 
 ---
 
@@ -455,6 +483,7 @@ source .venv/bin/activate
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q \
   tests/test_crawler_contract.py \
+  tests/test_migration_safety.py \
   tests/test_parsers.py \
   tests/test_regressions.py \
   tests/test_stability.py \

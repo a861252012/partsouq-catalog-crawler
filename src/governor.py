@@ -54,10 +54,10 @@ class RequestGovernor:
         with self._cond:
             while True:
                 now = time.monotonic()
-                rate = self._refill(now)
                 if now < self._block_until:
                     self._cond.wait(timeout=self._block_until - now)
                     continue
+                rate = self._refill(now)
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
                     return
@@ -68,7 +68,12 @@ class RequestGovernor:
         if seconds <= 0:
             return
         with self._cond:
-            self._block_until = max(self._block_until, time.monotonic() + seconds)
+            now = time.monotonic()
+            self._block_until = max(self._block_until, now + seconds)
+            # cooldown 期間不累積完整 burst。解除時只允許第一個 waiter
+            # 立即通過，其餘照正常 rate 逐一取得 token。
+            self._tokens = 1.0
+            self._last = self._block_until
             self._cond.notify_all()
 
     def slow(self, seconds: float = SLOW_DEFAULT_SECONDS):

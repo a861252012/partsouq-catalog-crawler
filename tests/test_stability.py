@@ -46,32 +46,50 @@ class TestSessionResilience(unittest.TestCase):
             raise requests.ConnectionError("RemoteDisconnected: stale socket")
 
         self.m.session.get = flaky_get
-        with mock.patch.object(self.m, "_reset_connections") as reset:
+        with (
+            mock.patch.object(self.m, "_reset_connections") as reset,
+            mock.patch("src.http_client.time.sleep"),
+        ):
             with self.assertRaises(requests.ConnectionError):
                 self.m.get("https://partsouq.com/x")
             reset.assert_called()
 
-    def test_hang_never_exceeds_timeout(self):
-        """卡住的請求不得永遠阻塞（必須在逾時內結束）。"""
-        t0 = time.monotonic()
-        with mock.patch.object(self.m.session, "get") as fake:
-            fake.side_effect = lambda url, timeout=None: time.sleep(5) or FakeResponse(200, "late")
-            try:
+    def test_every_wire_request_uses_configured_timeout(self):
+        """每次 wire request 都必須把有限 timeout 傳給 requests。
+
+        舊測試的 fake 自己 sleep 5 秒，並不會實際模擬 requests
+        的 timeout；這裡直接驗證每次 retry 的傳入值，也不用真實等待。
+        """
+        seen_timeouts = []
+
+        def timeout_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            raise requests.Timeout("synthetic timeout")
+
+        self.m.session.get = timeout_get
+        with mock.patch("src.http_client.time.sleep"):
+            with self.assertRaises(requests.Timeout):
                 self.m.get("https://partsouq.com/x")
-            except Exception:
-                pass
-            elapsed = time.monotonic() - t0
-        # 讀取逾時（CRAWL["http_timeout"]）限制住等待時間
-        self.assertLess(elapsed, 8)
+
+        self.assertEqual(len(seen_timeouts), CRAWL["max_retries"])
+        self.assertEqual(seen_timeouts, [CRAWL["http_timeout"]] * CRAWL["max_retries"])
 
     def test_challenge_triggers_refresh_once(self):
         """驗證頁回應必須剛好觸發一次 session 刷新。"""
-        with mock.patch(
-            "src.http_client.force_refresh_session",
-            return_value=[
-                {"name": "cf_clearance", "value": "new", "domain": "partsouq.com", "path": "/"},
-            ],
-        ) as refresh:
+        with (
+            mock.patch(
+                "src.http_client.force_refresh_session",
+                return_value=[
+                    {
+                        "name": "cf_clearance",
+                        "value": "new",
+                        "domain": "partsouq.com",
+                        "path": "/",
+                    },
+                ],
+            ) as refresh,
+            mock.patch("src.http_client.time.sleep"),
+        ):
             calls = {"n": 0}
 
             def chal_get(url, timeout=None):
@@ -120,6 +138,18 @@ class TestSessionResilience(unittest.TestCase):
                 FakeResponse(200, "Just a moment...", headers={}), "Just a moment..."
             )
         )
+
+    def test_challenge_body_marker_mutation_and_scan_boundary(self):
+        """合成變異 fixture：鎖定 marker 與前 8,000 字元的邊界。"""
+        marker = "Turnstile"
+        at_boundary = "x" * (8000 - len(marker)) + marker
+        after_boundary = "x" * (8001 - len(marker)) + marker
+        mutated = "Turnsti1e"
+
+        response = FakeResponse(200, headers={})
+        self.assertTrue(self.m._is_challenge(response, at_boundary))
+        self.assertFalse(self.m._is_challenge(response, after_boundary))
+        self.assertFalse(self.m._is_challenge(response, mutated))
 
     def test_refresh_replaces_cookies_entirely(self):
         """SOL review P2：刷新結果必須**整份**替換 cookie jar —— 新快照

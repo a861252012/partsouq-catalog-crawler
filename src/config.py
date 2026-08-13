@@ -71,6 +71,10 @@ CRAWL = {
     # 也不會在等待結束時形成突發流量。
     "request_rate": float(os.environ.get("PSQ_REQUEST_RATE", "0.5")),  # 全域每秒請求數
     "request_burst": int(os.environ.get("PSQ_REQUEST_BURST", "4")),  # token bucket burst 上限
+    # supervisor 的單趟執行期限。Crawler 也使用同一個值記錄最低 request
+    # budget；若已知剩餘 group 明顯超出樂觀容量，會在發送網路請求前
+    # 警告。此期限在 supervisor 重啟後重算，不能當成跨程序硬 SLA。
+    "max_run_days": float(os.environ.get("PSQ_MAX_RUN_DAYS", "25")),
     # 首頁品牌清單的最低品牌數（SOL P1）：首次爬取（空 DB）時閉合檢查
     # 拿「本次解析結果」對「DB 已知」沒有意義（兩者同源），縮水解析
     # 會被誤判成完整。低於此門檻視為網站縮水/反爬頁，run 直接 error。

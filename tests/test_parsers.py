@@ -141,6 +141,17 @@ class TestParseBrands(unittest.TestCase):
         html = '<li><a href="https://evil.example/en/catalog/genuine/locate?c=BAD">BAD</a></li>'
         self.assertEqual(parse_brands(html), [])
 
+    def test_mixed_valid_and_image_only_brand_reports_malformed(self):
+        html = """
+        <ul>
+          <li><a href="/en/catalog/genuine/locate?c=TOYOTA">TOYOTA</a></li>
+          <li><a href="/en/catalog/genuine/locate?c=NISSAN"><img src="nissan.png"></a></li>
+        </ul>
+        """
+        brands, malformed = parse_brands(html, diagnostics=True)
+        self.assertEqual([brand["name"] for brand in brands], ["TOYOTA"])
+        self.assertEqual(malformed, 1)
+
 
 class TestParseBrandIndex(unittest.TestCase):
     """locate 頁面 → 型號清單。"""
@@ -165,6 +176,13 @@ class TestParseBrandIndex(unittest.TestCase):
     def test_ignores_off_domain_pick_endpoint(self):
         html = '<a href="https://evil.example/en/catalog/genuine/pick?ssd=S">MODEL</a>'
         self.assertEqual(parse_brand_index(html, "TOYOTA"), [])
+
+    def test_same_domain_foreign_brand_model_is_malformed(self):
+        html = '<a href="/en/catalog/genuine/pick?c=NISSAN&amp;model=NOTE&amp;ssd=S">NOTE</a>'
+        self.assertEqual(
+            parse_brand_index(html, "TOYOTA", diagnostics=True),
+            ([], 1),
+        )
 
 
 class TestParseVehicles(unittest.TestCase):
@@ -273,6 +291,37 @@ class TestParseVehicles(unittest.TestCase):
         """
         self.assertEqual(parse_vehicles(html, "TOYOTA"), [])
 
+    def test_mixed_valid_and_empty_vehicle_candidate_reports_malformed(self):
+        html = """
+        <table>
+          <tr><th class="__name">Name</th><th class="__model">Model</th></tr>
+          <tr><td><a href="/en/catalog/genuine/vehicle?ssd=S1&amp;vid=1">GOOD</a></td><td>M1</td></tr>
+          <tr><td><a href="/en/catalog/genuine/vehicle?ssd=S2&amp;vid=2"><img src="x"></a></td><td></td></tr>
+        </table>
+        """
+        vehicles, malformed = parse_vehicles(html, "TOYOTA", diagnostics=True)
+        self.assertEqual([vehicle["name"] for vehicle in vehicles], ["GOOD"])
+        self.assertEqual(malformed, 1)
+
+    def test_same_domain_foreign_vehicle_context_is_malformed(self):
+        html = """
+        <table>
+          <tr><th class="__name">Name</th><th class="__model">Model</th></tr>
+          <tr>
+            <td><a href="/en/catalog/genuine/vehicle?c=NISSAN&amp;ssd=S1&amp;vid=1">BAD</a></td>
+            <td>M1</td>
+          </tr>
+        </table>
+        """
+        self.assertEqual(
+            parse_vehicles(
+                html,
+                "TOYOTA",
+                diagnostics=True,
+            ),
+            ([], 1),
+        )
+
 
 class TestParseCategoryLinks(unittest.TestCase):
     """vehicle 頁面 → 分類導覽連結。"""
@@ -296,7 +345,7 @@ class TestParseCategoryLinks(unittest.TestCase):
 
     def test_category_candidates_are_canonical_and_deduplicated(self):
         html = """
-        <a href="/en/catalog/genuine/vehicle?cid=2&amp;cname=BODY"><img src="x"></a>
+        <a href="/en/catalog/genuine/vehicle?cid=2"><img src="x"></a>
         <a href="/en/catalog/genuine/vehicle?cid=2&amp;cname=BODY">BODY</a>
         <a href="/redirect?next=/en/catalog/genuine/vehicle?cid=3">REDIRECT</a>
         """
@@ -318,6 +367,22 @@ class TestParseCategoryLinks(unittest.TestCase):
             '<a href="https://evil.example/en/catalog/genuine/vehicle?cid=2&amp;cname=BAD">BAD</a>'
         )
         self.assertEqual(parse_category_links(html, "TOYOTA", diagnostics=True), ([], 0))
+
+    def test_same_domain_foreign_category_context_is_malformed(self):
+        html = """
+        <a href="/en/catalog/genuine/vehicle?c=TOYOTA&amp;ssd=S1&amp;vid=1&amp;cid=1">ENGINE</a>
+        <a href="/en/catalog/genuine/vehicle?c=NISSAN&amp;ssd=S1&amp;vid=1&amp;cid=2">BODY</a>
+        <a href="/en/catalog/genuine/vehicle?c=TOYOTA&amp;ssd=OTHER&amp;vid=1&amp;cid=3">OTHER</a>
+        """
+        categories, malformed = parse_category_links(
+            html,
+            "TOYOTA",
+            diagnostics=True,
+            expected_ssd="S1",
+            expected_vid="1",
+        )
+        self.assertEqual([category["cid"] for category in categories], ["1"])
+        self.assertEqual(malformed, 2)
 
 
 class TestParseGroups(unittest.TestCase):
@@ -416,6 +481,25 @@ class TestParseGroups(unittest.TestCase):
         )
         self.assertEqual(parse_groups(html, "TOYOTA", diagnostics=True), ([], 0))
 
+    def test_same_domain_foreign_group_context_is_malformed(self):
+        html = """
+        <a href="/en/catalog/genuine/unit?c=TOYOTA&amp;ssd=S1&amp;vid=1&amp;cid=2&amp;uid=GOOD">2201: GOOD</a>
+        <a href="/en/catalog/genuine/unit?c=NISSAN&amp;ssd=S1&amp;vid=1&amp;cid=2&amp;uid=BAD1">2202: BAD BRAND</a>
+        <a href="/en/catalog/genuine/unit?c=TOYOTA&amp;ssd=S1&amp;vid=9&amp;cid=2&amp;uid=BAD2">2203: BAD VEHICLE</a>
+        <a href="/en/catalog/genuine/unit?c=TOYOTA&amp;ssd=S1&amp;vid=1&amp;cid=3&amp;uid=BAD3">3301: BAD CATEGORY</a>
+        """
+        groups, malformed = parse_groups(
+            html,
+            "TOYOTA",
+            default_cid="2",
+            diagnostics=True,
+            expected_ssd="S1",
+            expected_vid="1",
+            expected_cid="2",
+        )
+        self.assertEqual([group["uid"] for group in groups], ["GOOD"])
+        self.assertEqual(malformed, 3)
+
 
 class TestParseParts(unittest.TestCase):
     """unit 頁面 → 零件明細。"""
@@ -504,6 +588,33 @@ class TestParseParts(unittest.TestCase):
         parts, malformed = parse_parts(html)
         self.assertEqual(parts, [], "缺欄列不得當零件")
         self.assertEqual(malformed, 1, "缺欄列必須計入 malformed")
+
+    def test_seven_column_row_is_malformed(self):
+        html = """
+        <table><tbody><tr>
+          <td><a href="/en/search/all?q=P1">P1</a></td>
+          <td>NAME</td><td>EXTRA</td><td>CODE</td><td>NOTE</td><td>01</td><td>RANGE</td>
+        </tr></tbody></table>
+        """
+        self.assertEqual(parse_parts(html), ([], 1))
+
+    def test_external_search_link_is_malformed(self):
+        html = """
+        <table><tbody><tr>
+          <td><a href="https://evil.example/en/search/all?q=P1">P1</a></td>
+          <td>NAME</td><td>CODE</td><td>NOTE</td><td>01</td><td>RANGE</td>
+        </tr></tbody></table>
+        """
+        self.assertEqual(parse_parts(html), ([], 1))
+
+    def test_query_and_displayed_part_number_must_match(self):
+        html = """
+        <table><tbody><tr>
+          <td><a href="/en/search/all?q=REAL">DISPLAY</a></td>
+          <td>NAME</td><td>CODE</td><td>NOTE</td><td>01</td><td>RANGE</td>
+        </tr></tbody></table>
+        """
+        self.assertEqual(parse_parts(html), ([], 1))
 
     def test_parses_without_tbody(self):
         """P2：零件表沒有顯式 <tbody> 時仍要解析（html.parser 不會自動補）。"""

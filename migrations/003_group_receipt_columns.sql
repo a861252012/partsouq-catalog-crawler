@@ -13,6 +13,9 @@
 -- 用法：mysql ... partsouq_crawler < migrations/003_group_receipt_columns.sql
 --       mysql ... partsouq_crawler_test < migrations/003_group_receipt_columns.sql
 
+SET SESSION lock_wait_timeout = 30;
+SET SESSION innodb_lock_wait_timeout = 30;
+
 SET @col := (SELECT COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='groups_t'
     AND COLUMN_NAME='fetched_run_key');

@@ -6,6 +6,9 @@
 -- 執行前必須停止 crawler；ALTER / identity backfill 不是 online migration。
 -- 可重複執行；不含 USE，請由 mysql 命令列指定資料庫。
 
+SET SESSION lock_wait_timeout = 30;
+SET SESSION innodb_lock_wait_timeout = 30;
+
 -- vehicles.identity_hash
 SET @vehicle_v5_exists := (SELECT COUNT(*) FROM information_schema.STATISTICS
   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='vehicles'

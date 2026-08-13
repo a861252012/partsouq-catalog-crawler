@@ -12,15 +12,39 @@
 -- vehicles 時必須先備份，再由操作者顯式設定以下 session 變數，
 -- 授權清除 normalized 目錄後完整重爬。published_parts 不受 CASCADE
 -- 影響，v_parts 在新 success 前仍保留上一版 snapshot。
-SET @v5_was_missing := (SELECT COUNT(*) = 0 FROM information_schema.STATISTICS
+--
+-- 避免 migration 無限等待 crawler 或其他 session 的 metadata / row lock。
+-- 逾時代表仍有 writer 或長交易；停止 migration、清查後直接重跑。
+SET SESSION lock_wait_timeout = 30;
+SET SESSION innodb_lock_wait_timeout = 30;
+
+SET @v5_index_rows := (SELECT COUNT(*) FROM information_schema.STATISTICS
   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='vehicles'
     AND INDEX_NAME='uq_vehicle_identity_v5');
+SET @v5_index_valid := (SELECT IF(
+  COUNT(*) = 2 AND MAX(NON_UNIQUE) = 0 AND
+    GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) = 'model_id,identity_hash',
+  1, 0)
+  FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='vehicles'
+    AND INDEX_NAME='uq_vehicle_identity_v5');
+SET @v5_was_missing := (@v5_index_valid = 0);
+SET @cat_index_rows := (SELECT COUNT(*) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='categories'
+    AND INDEX_NAME='uq_cat_cid');
+SET @cat_index_valid := (SELECT IF(
+  COUNT(*) = 2 AND MAX(NON_UNIQUE) = 0 AND
+    GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) = 'vehicle_id,cid',
+  1, 0)
+  FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='categories'
+    AND INDEX_NAME='uq_cat_cid');
 SET @vehicle_rows := (SELECT COUNT(*) FROM vehicles);
 SET @allow_vehicle_rebuild := COALESCE(@PARTSOUQ_ALLOW_V5_VEHICLE_REBUILD, 0);
 SET @category_collision := (SELECT COUNT(*) FROM (
   SELECT vehicle_id, cid
   FROM categories
-  WHERE cid IS NOT NULL AND cid <> ''
+  WHERE cid IS NOT NULL
   GROUP BY vehicle_id, cid
   HAVING COUNT(*) > 1
 ) AS duplicate_category_identity);
@@ -28,6 +52,14 @@ DROP PROCEDURE IF EXISTS assert_partsouq_005_rebuild_authorized;
 DELIMITER //
 CREATE PROCEDURE assert_partsouq_005_rebuild_authorized()
 BEGIN
+  IF @v5_index_rows > 0 AND @v5_index_valid = 0 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'migration 005: uq_vehicle_identity_v5 definition mismatch';
+  END IF;
+  IF @cat_index_rows > 0 AND @cat_index_valid = 0 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'migration 005: uq_cat_cid definition mismatch';
+  END IF;
   IF @v5_was_missing = 1 AND @vehicle_rows > 0 AND @allow_vehicle_rebuild <> 1 THEN
     SIGNAL SQLSTATE '45000'
       SET MESSAGE_TEXT = 'migration 005: set @PARTSOUQ_ALLOW_V5_VEHICLE_REBUILD=1 after backup';
@@ -41,22 +73,69 @@ DELIMITER ;
 CALL assert_partsouq_005_rebuild_authorized();
 DROP PROCEDURE assert_partsouq_005_rebuild_authorized;
 
--- 重建資料樹後，本月舊 success 不得讓 crawler 直接 early-exit。
+-- 重建資料樹後，任何舊 success 都不得讓 crawler 直接 early-exit。
 -- 必須在 DELETE 前先落地；若 migration 在兩句之間中斷，重跑時
 -- vehicles 已可能為空，仍不能讓舊 success 掩蓋已清空的 normalized tree。
--- 只要 v5 completion marker 尚未存在就重設本月 run；下次普通啟動
--- 會完整重爬，不需要額外 --fresh。
+-- 不從資料庫日期函式推導月份，避免 DB 與 crawler timezone 在月界不同。
+-- 只要 v5 completion marker 尚未存在，就讓所有既有 success 失效；
+-- published_parts 不變，所以上一份已發布 snapshot 仍可讀。
 SET @sql := IF(@v5_was_missing = 1,
   'UPDATE crawl_runs SET status = ''error'', finished_at = NOW(),
      error_msg = ''vehicle v5 identity rebuild required''
-   WHERE run_key = DATE_FORMAT(CURDATE(), ''%Y-%m'')',
-  'SELECT ''current run invalidation not required''');
+   WHERE status = ''success''',
+  'SELECT ''success run invalidation not required''');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+COMMIT;
 
-SET @sql := IF(@v5_was_missing = 1 AND @vehicle_rows > 0,
-  'DELETE FROM vehicles',
-  'SELECT ''vehicle rebuild not required''');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+-- 大型 tree 不使用單句 cascading DELETE。依 child -> parent 每批 1000 列
+-- 刪除並 COMMIT；lock timeout 或連線中斷時，已完成批次會保留，重跑會從
+-- 剩餘資料繼續。published_parts 沒有 FK 指向 normalized tree，不會被刪除。
+DROP PROCEDURE IF EXISTS rebuild_partsouq_005_vehicle_tree;
+DELIMITER //
+CREATE PROCEDURE rebuild_partsouq_005_vehicle_tree()
+BEGIN
+  DECLARE deleted_rows INT DEFAULT 0;
+
+  IF @v5_was_missing = 1 THEN
+    SET deleted_rows = 1;
+    WHILE deleted_rows > 0 DO
+      DELETE FROM crawl_state ORDER BY id LIMIT 1000;
+      SET deleted_rows = ROW_COUNT();
+      COMMIT;
+    END WHILE;
+
+    SET deleted_rows = 1;
+    WHILE deleted_rows > 0 DO
+      DELETE FROM parts ORDER BY id LIMIT 1000;
+      SET deleted_rows = ROW_COUNT();
+      COMMIT;
+    END WHILE;
+
+    SET deleted_rows = 1;
+    WHILE deleted_rows > 0 DO
+      DELETE FROM groups_t ORDER BY id LIMIT 1000;
+      SET deleted_rows = ROW_COUNT();
+      COMMIT;
+    END WHILE;
+
+    SET deleted_rows = 1;
+    WHILE deleted_rows > 0 DO
+      DELETE FROM categories ORDER BY id LIMIT 1000;
+      SET deleted_rows = ROW_COUNT();
+      COMMIT;
+    END WHILE;
+
+    SET deleted_rows = 1;
+    WHILE deleted_rows > 0 DO
+      DELETE FROM vehicles ORDER BY id LIMIT 1000;
+      SET deleted_rows = ROW_COUNT();
+      COMMIT;
+    END WHILE;
+  END IF;
+END//
+DELIMITER ;
+CALL rebuild_partsouq_005_vehicle_tree();
+DROP PROCEDURE rebuild_partsouq_005_vehicle_tree;
 
 SET @col := (SELECT COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='vehicles'
@@ -91,14 +170,17 @@ SET @sql := IF(@v5_was_missing = 1,
   'SELECT ''vehicle identity v5 already applied''');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
-SET @vehicle_collision := IF(@v5_was_missing = 1,
-  (SELECT COUNT(*) FROM (
+-- 用 dynamic SQL 隔離 staging 欄位。完成後重跑時該欄位已刪除；即使
+-- IF 條件為 false，直接寫在 expression 裡仍可能於 prepare 階段解析失敗。
+SET @sql := IF(@v5_was_missing = 1,
+  'SELECT COUNT(*) INTO @vehicle_collision FROM (
     SELECT model_id, identity_hash_v5
     FROM vehicles
     GROUP BY model_id, identity_hash_v5
     HAVING COUNT(*) > 1
-  ) AS duplicate_vehicle_identity),
-  0);
+  ) AS duplicate_vehicle_identity',
+  'SELECT 0 INTO @vehicle_collision');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 DROP PROCEDURE IF EXISTS assert_partsouq_005_identity;
 DELIMITER //
@@ -134,19 +216,9 @@ SET @sql := IF(@v5_was_missing = 1,
   'SELECT ''vehicle identity hash already v5''');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
--- identity 公式變更後，非 success run 的舊 state/receipt/marker 無法
--- 再與 v5 key 閉合。只在首次套用 v5 時清除，保留 row_count 基準。
-DELETE cs FROM crawl_state cs
-JOIN crawl_runs cr ON cr.run_key = cs.run_key
-WHERE @v5_was_missing = 1 AND (cr.status IS NULL OR cr.status <> 'success');
-UPDATE groups_t g
-JOIN crawl_runs cr ON cr.run_key = g.fetched_run_key
-SET g.fetched_run_key = NULL, g.fetched_status = NULL
-WHERE @v5_was_missing = 1 AND (cr.status IS NULL OR cr.status <> 'success');
-UPDATE parts p
-JOIN crawl_runs cr ON cr.id = p.seen_run_id
-SET p.seen_run_id = NULL
-WHERE @v5_was_missing = 1 AND (cr.status IS NULL OR cr.status <> 'success');
+-- identity 公式變更後，舊 state/receipt/marker 無法再與 v5 key 閉合。
+-- crawl_state 已在 restartable rebuild procedure 分批清除；group receipt 與
+-- part membership 隨 normalized tree 一起分批刪除，不需要再做全表 UPDATE。
 
 -- final index 最後建立：它也是 migration 完成 marker。若中途異常，
 -- 重跑時 @v5_was_missing 仍為 1，會完成 state invalidation 再標記完成。
@@ -158,9 +230,7 @@ SET @sql := IF(@final_idx = 0,
   'SELECT ''uq_vehicle_identity_v5 already exists''');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
-SET @cat_idx := (SELECT COUNT(*) FROM information_schema.STATISTICS
-  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='categories'
-    AND INDEX_NAME='uq_cat_cid');
+SET @cat_idx := @cat_index_rows;
 SET @sql := IF(@cat_idx = 0,
   'ALTER TABLE categories ADD UNIQUE KEY uq_cat_cid (vehicle_id, cid)',
   'SELECT ''uq_cat_cid already exists''');

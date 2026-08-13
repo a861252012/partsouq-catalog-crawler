@@ -1,4 +1,4 @@
-"""Repository 層測試：對獨立的測試資料庫執行（絕不碰現役 partsouq_crawler）。
+"""Repository 層測試：明確 opt-in 後才對獨立測試資料庫執行。
 
 測試資料庫 partsouq_crawler_test 由 schema.sql 建立（含 FK），每次測試
 前清空資料，因此可以安全地驗證 upsert 語意、唯一鍵行為與計數統計。
@@ -8,8 +8,12 @@
 完全不影響其他測試模組。
 """
 
+import os
 import time
 import unittest
+from unittest.mock import MagicMock, Mock, patch
+
+import pymysql
 
 from src.config import DB_CONFIG
 from src.db import Database
@@ -22,16 +26,29 @@ from src.repositories import (
 )
 
 _TEST_DB = "partsouq_crawler_test"
+_DB_TEST_ENV = "PSQ_RUN_REPOSITORY_TESTS"
+_RUN_DB_TESTS = os.environ.get(_DB_TEST_ENV) == "1"
+
+
+def _require_db_tests_opt_in():
+    if os.environ.get(_DB_TEST_ENV) != "1":
+        raise RuntimeError(f"set {_DB_TEST_ENV}=1 to run destructive repository tests")
 
 
 def _test_db() -> Database:
     """建立連到測試資料庫的連線。"""
+    _require_db_tests_opt_in()
     DB_CONFIG["database"] = _TEST_DB
     return Database().connect()
 
 
 def _wipe(db: Database):
     """清空所有資料表（由 FK 決定刪除順序）。"""
+    _require_db_tests_opt_in()
+    row = db.query_one("SELECT DATABASE() AS database_name")
+    database_name = row.get("database_name") if row else None
+    if database_name != _TEST_DB:
+        raise RuntimeError(f"refusing destructive repository tests on database {database_name!r}")
     for sql in (
         "SET FOREIGN_KEY_CHECKS = 0",
         "TRUNCATE published_parts",
@@ -78,6 +95,7 @@ def _brand_chain(brands, vehicles, parts, db):
     return brand_id, model_id, vehicle_id, category_id, group_id
 
 
+@unittest.skipUnless(_RUN_DB_TESTS, f"set {_DB_TEST_ENV}=1 to run database tests")
 class TestBrandRepository(unittest.TestCase):
     def setUp(self):
         self.db = _test_db()
@@ -109,6 +127,7 @@ class TestBrandRepository(unittest.TestCase):
         self.assertEqual(models[0]["url"], "u2")
 
 
+@unittest.skipUnless(_RUN_DB_TESTS, f"set {_DB_TEST_ENV}=1 to run database tests")
 class TestVehicleRepository(unittest.TestCase):
     def setUp(self):
         self.db = _test_db()
@@ -194,6 +213,7 @@ class TestVehicleRepository(unittest.TestCase):
         self.assertEqual(row["ssd"], "TOKEN-B")
 
 
+@unittest.skipUnless(_RUN_DB_TESTS, f"set {_DB_TEST_ENV}=1 to run database tests")
 class TestPartRepository(unittest.TestCase):
     def setUp(self):
         self.db = _test_db()
@@ -257,6 +277,7 @@ class TestPartRepository(unittest.TestCase):
         self.assertEqual(cur.fetchone()["seen_run_id"], 46)
 
 
+@unittest.skipUnless(_RUN_DB_TESTS, f"set {_DB_TEST_ENV}=1 to run database tests")
 class TestCrawlRepository(unittest.TestCase):
     def setUp(self):
         self.db = _test_db()
@@ -420,9 +441,8 @@ class TestCrawlRepository(unittest.TestCase):
         # 空 run_key 回傳空集合（安全預設）
         self.assertEqual(self.crawl.fetched_group_map(vehicle_id, ""), {})
 
-    def test_previous_row_count_map_excludes_current_run(self):
-        """SOL review P1：縮水偵測的參考點是「上一 run 之前」的歷史
-        receipt —— 本 run 的 receipt 不當參考點。"""
+    def test_previous_row_count_map_uses_monotonic_verified_high_water(self):
+        """縮水偵測基準只升不降，not_found 也不能清掉歷史最高值。"""
         brands = BrandRepository(self.db)
         vehicles = VehicleRepository(self.db)
         _wipe(self.db)
@@ -440,21 +460,52 @@ class TestCrawlRepository(unittest.TestCase):
         g2 = vehicles.upsert_group(category_id, "G2", "g", "u", "url")
         g3 = vehicles.upsert_group(category_id, "G3", "g", "u", "url")
         self.db.commit()
-        # 上月：G1 抓了 30 筆、G2 抓了 5 筆
+        # 上月：G1 抓了 30 筆、G2 抓了 5 筆。
         self.crawl.mark_group_fetched(g1, "2026-07", status="done", row_count=30)
         self.crawl.mark_group_fetched(g2, "2026-07", status="done", row_count=5)
         self.db.commit()
-        # 本月：G3 只有本 run 的 receipt（無歷史）—— 不得當縮水參考點
+        # 本月較小的 done 不得降低 G1；not_found 不得降低 G2。
+        self.crawl.mark_group_fetched(g1, "2026-08", status="done", row_count=20)
+        self.crawl.mark_group_fetched(g2, "2026-08", status="not_found", row_count=0)
         self.crawl.mark_group_fetched(g3, "2026-08", status="done", row_count=12)
         self.db.commit()
         prev = self.crawl.previous_row_count_map(vehicle_id, "2026-08")
-        self.assertEqual(prev[("1", "G1")], 30, "參考點必須是上一 run 的 30 筆")
+        self.assertEqual(prev[("1", "G1")], 30, "較小的 done 不得降低 30 筆 high-water")
         self.assertEqual(prev[("1", "G2")], 5)
-        self.assertNotIn(("1", "G3"), prev)
-        self.assertNotIn(("ENGINE", "G3"), prev, "只有本 run receipt 的組不得當參考點")
+        self.assertEqual(prev[("1", "G3")], 12)
         self.assertEqual(self.crawl.previous_row_count(g1), 30, "逐組後備查詢取歷史最大值")
         # 空 run_key 回傳空 dict（安全預設）
         self.assertEqual(self.crawl.previous_row_count_map(vehicle_id, ""), {})
+
+    def test_publish_snapshot_upserts_deletes_stale_and_rolls_back_atomically(self):
+        brands = BrandRepository(self.db)
+        vehicles = VehicleRepository(self.db)
+        parts = PartRepository(self.db)
+        _, _, _, _, group_id = _brand_chain(brands, vehicles, parts, self.db)
+        run_id = self.crawl.start_run("2026-08")
+        payload = [
+            {"part_number": "P1", "name": "ONE", "range_str": ""},
+            {"part_number": "P2", "name": "TWO", "range_str": ""},
+        ]
+        parts.upsert_parts(group_id, payload, run_id=run_id)
+        self.assertEqual(self.crawl.publish_success_parts(run_id), 2)
+        self.db.commit()
+
+        next_run_id = self.crawl.start_run("2026-09")
+        self.db.commit()
+        parts.upsert_parts(group_id, payload[:1], run_id=next_run_id)
+        self.assertEqual(self.crawl.publish_success_parts(next_run_id), 1)
+        self.db.rollback()
+        row = self.db.query_one("SELECT COUNT(*) AS n FROM published_parts")
+        self.assertEqual(row["n"], 2, "rollback 後必須保留上一版完整 snapshot")
+
+        parts.upsert_parts(group_id, payload[:1], run_id=next_run_id)
+        self.assertEqual(self.crawl.publish_success_parts(next_run_id), 1)
+        self.db.commit()
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n, MAX(part_number) AS part_number FROM published_parts"
+        )
+        self.assertEqual((row["n"], row["part_number"]), (1, "P1"))
 
     def test_start_run_does_not_downgrade_success(self):
         """P2：同月已有 success 時，start_run 不把它覆寫成 running。"""
@@ -696,6 +747,142 @@ class TestCrawlRepository(unittest.TestCase):
             model_id, {"name": "ALPHARD", "model_code": "AGH30", "ssd": "s"}
         )
         self.assertEqual(vehicles.list_vehicle_keys("TOYOTA"), [expected_hash])
+
+
+class TestRepositorySqlContracts(unittest.TestCase):
+    """不連資料庫的 SQL／安全邊界測試。"""
+
+    def test_sql_errors_rollback_thread_transaction(self):
+        for error in (
+            pymysql.err.DataError(1406, "data too long"),
+            pymysql.err.IntegrityError(1062, "duplicate key"),
+            pymysql.err.OperationalError(1040, "server busy"),
+        ):
+            for method_name, cursor_method, args in (
+                ("_execute", "execute", ("UPDATE parts SET name = %s", ("x",))),
+                ("_executemany", "executemany", ("INSERT INTO parts VALUES (%s)", [(1,)])),
+            ):
+                with self.subTest(method=method_name, error=type(error).__name__):
+                    db = Database()
+                    conn = MagicMock()
+                    cursor = conn.cursor.return_value.__enter__.return_value
+                    getattr(cursor, cursor_method).side_effect = error
+                    db._thread_conn = Mock(return_value=conn)
+                    db.rollback = Mock()
+
+                    with self.assertRaises(type(error)):
+                        getattr(db, method_name)(*args)
+
+                    db.rollback.assert_called_once_with()
+
+    def test_category_with_cid_uses_single_safe_upsert(self):
+        db = Mock()
+        db._execute.return_value = Mock(lastrowid=17)
+
+        category_id = VehicleRepository(db).upsert_category(3, "ENGINE", "1")
+
+        self.assertEqual(category_id, 17)
+        db._execute.assert_called_once()
+        sql, params = db._execute.call_args.args
+        self.assertIn("ON DUPLICATE KEY UPDATE", sql)
+        self.assertIn("id = LAST_INSERT_ID(id)", sql)
+        self.assertEqual(params, (3, "ENGINE", "1"))
+
+    def test_part_membership_upserts_current_then_clears_only_stale(self):
+        db = Mock()
+        existing = Mock()
+        existing.fetchall.return_value = [{"part_number": "OLD", "range_str": ""}]
+        events = []
+
+        def execute(sql, params=None):
+            events.append(("execute", sql, params))
+            return existing
+
+        def executemany(sql, rows):
+            events.append(("executemany", sql, rows))
+
+        db._execute.side_effect = execute
+        db._executemany.side_effect = executemany
+
+        new_count = PartRepository(db).upsert_parts(
+            7, [{"part_number": "NEW", "range_str": ""}], run_id=46
+        )
+
+        self.assertEqual(new_count, 1)
+        self.assertEqual([event[0] for event in events], ["execute", "executemany", "execute"])
+        stale_sql = events[-1][1]
+        self.assertIn("seen_run_id <> %s", stale_sql)
+        self.assertEqual(events[-1][2], (7, 46))
+
+    def test_verified_row_count_is_monotonic_and_done_only(self):
+        db = Mock()
+        repo = CrawlRepository(db)
+
+        repo.mark_group_fetched(9, "2026-08", status="done", row_count=20)
+        done_sql, done_params = db._execute.call_args.args
+        self.assertIn("GREATEST(verified_row_count, %s)", done_sql)
+        self.assertEqual(done_params, ("2026-08", "done", 20, 20, 9))
+
+        db.reset_mock()
+        repo.mark_group_fetched(9, "2026-09", status="not_found", row_count=0)
+        not_found_sql, _ = db._execute.call_args.args
+        self.assertNotIn("verified_row_count", not_found_sql)
+
+    def test_previous_count_queries_durable_high_water(self):
+        db = Mock()
+        cursor = Mock()
+        cursor.fetchall.return_value = [{"cid": "1", "code": "G1", "row_count": 30}]
+        db._execute.return_value = cursor
+
+        result = CrawlRepository(db).previous_row_count_map(4, "2026-08")
+
+        self.assertEqual(result, {("1", "G1"): 30})
+        sql, params = db._execute.call_args.args
+        self.assertIn("g.verified_row_count", sql)
+        self.assertNotIn("fetched_run_key", sql)
+        self.assertEqual(params, (4,))
+
+    def test_remaining_group_count_excludes_current_run_receipts(self):
+        db = Mock()
+        cursor = Mock()
+        cursor.fetchone.return_value = {"n": 42}
+        db._execute.return_value = cursor
+
+        count = CrawlRepository(db).remaining_group_count("2026-08")
+
+        self.assertEqual(count, 42)
+        sql, params = db._execute.call_args.args
+        self.assertIn("fetched_run_key IS NULL OR fetched_run_key <> %s", sql)
+        self.assertEqual(params, ("2026-08",))
+
+        db.reset_mock()
+        db._execute.return_value = cursor
+        self.assertEqual(CrawlRepository(db).remaining_group_count(), 42)
+        db._execute.assert_called_once_with("SELECT COUNT(*) AS n FROM groups_t")
+
+    def test_scope_prefix_uses_escaped_sargable_like(self):
+        db = Mock()
+        cursor = Mock()
+        cursor.fetchall.return_value = []
+        db._execute.return_value = cursor
+
+        CrawlRepository(db).scope_keys("2026-08", "model", r"A%_!B")
+
+        sql, params = db._execute.call_args.args
+        self.assertIn("scope_key LIKE CONCAT", sql)
+        self.assertNotIn("LOCATE", sql)
+        self.assertEqual(params, ("2026-08", "model", "A!%!_!!B"))
+
+    def test_wipe_refuses_non_test_database_before_truncate(self):
+        db = Mock()
+        db.query_one.return_value = {"database_name": "partsouq_crawler"}
+
+        with patch.dict(os.environ, {_DB_TEST_ENV: "1"}):
+            with self.assertRaisesRegex(RuntimeError, "refusing destructive"):
+                _wipe(db)
+
+        db._execute.assert_not_called()
+        db.commit.assert_not_called()
 
 
 if __name__ == "__main__":

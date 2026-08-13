@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS groups_t (
   fetched_run_key VARCHAR(32) NULL,          -- 最後一次抓取零件的 run_key（group terminal state，F1b）
   fetched_status VARCHAR(16) NULL,           -- done / not_found（F5 receipt；HTTP 200 零解析一律視為異常不寫 receipt）
   fetched_row_count INT DEFAULT 0,           -- 本組零件筆數（F5 receipt，content hash 基礎）
+  verified_row_count INT NOT NULL DEFAULT 0, -- 歷次 done 的最高筆數；縮水偵測基準，只升不降
   UNIQUE KEY uq_group (category_id, code),
   CONSTRAINT fk_group_cat FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -101,7 +102,7 @@ CREATE TABLE IF NOT EXISTS parts (
 -- 最近一次完整 success 的不可變、反正規化 current snapshot。
 -- normalized tables 可讓 failed/partial attempt 繼續 upsert；v_parts 只讀
 -- 本表，因此不會在未完成 attempt 中途改變。成功收尾時以同一交易
--- DELETE + INSERT 重建；失敗 rollback 後仍保留上一版。
+-- upsert 本次列並刪除過期列；失敗 rollback 後仍保留上一版。
 CREATE TABLE IF NOT EXISTS published_parts (
   part_id        INT NOT NULL PRIMARY KEY,
   brand          VARCHAR(64) NOT NULL,
